@@ -1,14 +1,13 @@
 import re
-import itertools
 import requests
 import pandas as pd
 import streamlit as st
 from bs4 import BeautifulSoup
 
-st.set_page_config(page_title="オートレースAI Mobile v2.5", layout="wide")
+st.set_page_config(page_title="オートレースAI Mobile v2.7", layout="wide")
 
-st.title("🏍️ オートレースAI Mobile v2.5")
-st.caption("天候取得 + AI指数 + ヒモ指数 + 2連単/3連単 + オッズ取得 + 期待値AI")
+st.title("🏍️ オートレースAI Mobile v2.7")
+st.caption("AI指数 + ヒモ指数 + 天候補正 + オッズ期待値 + 期待値暴走防止 + 荒れ度AI")
 
 DEFAULT_URL = "https://www.winticket.jp/autorace/isesaki/racecard/2026062403/1/12"
 
@@ -23,8 +22,11 @@ max_3_honsen = st.sidebar.slider("3連単 🔥本線", 1, 15, 5)
 max_3_ana = st.sidebar.slider("3連単 🎯穴", 1, 15, 4)
 max_3_osae = st.sidebar.slider("3連単 🛡️抑え", 1, 25, 10)
 
+st.sidebar.header("オッズ・期待値")
 use_odds = st.sidebar.checkbox("オッズ取得を使う", value=True)
 max_value_bets = st.sidebar.slider("期待値AI 表示点数", 3, 20, 8)
+max_odds_filter = st.sidebar.slider("期待値AI 最大オッズ", 30.0, 500.0, 120.0)
+min_ai_bet_score = st.sidebar.slider("期待値AI 最低AI買い目指数", 50.0, 100.0, 75.0)
 
 
 def clean_text(text: str) -> str:
@@ -69,7 +71,7 @@ def extract_race_info(text: str) -> dict:
     if m:
         info["天候"] = m.group(1)
     else:
-        for w in ["晴", "曇", "雨", "小雨", "雪", "小雪"]:
+        for w in ["小雨", "雨", "晴", "曇", "小雪", "雪"]:
             if w in text:
                 info["天候"] = w
                 break
@@ -171,6 +173,7 @@ def parse_players(text: str) -> pd.DataFrame:
     df = pd.DataFrame(rows)
     if not df.empty:
         df = df.sort_values("車番").reset_index(drop=True)
+
     return df
 
 
@@ -189,6 +192,7 @@ def to_numeric_safe(df: pd.DataFrame) -> pd.DataFrame:
 
 def minmax_score(series: pd.Series, reverse: bool = False) -> pd.Series:
     s = pd.to_numeric(series, errors="coerce")
+
     if s.isna().all():
         return pd.Series([50.0] * len(s), index=s.index)
 
@@ -466,6 +470,145 @@ def add_ai_index(df: pd.DataFrame, race_info: dict) -> pd.DataFrame:
     return df
 
 
+def calc_confidence(df: pd.DataFrame) -> dict:
+    if df.empty or len(df) < 2:
+        return {"label": "判定不可", "stars": "☆☆☆☆☆", "comment": "データ不足", "gap": 0}
+
+    top = float(df.iloc[0]["AI指数"])
+    second = float(df.iloc[1]["AI指数"])
+    gap1 = top - second
+
+    if gap1 >= 45:
+        label = "超本命寄り"
+        stars = "★★★★★"
+        comment = "1位の指数が大きく抜けています。ただし3着ヒモ荒れ注意。"
+    elif gap1 >= 30:
+        label = "本命寄り"
+        stars = "★★★★☆"
+        comment = "1位優勢。3着はヒモ指数・前残り・天候を重視。"
+    elif gap1 >= 15:
+        label = "やや本命"
+        stars = "★★★☆☆"
+        comment = "上位拮抗気味。穴も注意。"
+    elif gap1 >= 8:
+        label = "混戦"
+        stars = "★★☆☆☆"
+        comment = "指数差が小さめ。穴・抑えも必要。"
+    else:
+        label = "大混戦"
+        stars = "★☆☆☆☆"
+        comment = "指数差がかなり小さいです。荒れ注意。"
+
+    return {"label": label, "stars": stars, "comment": comment, "gap": round(gap1, 2)}
+
+
+def calc_roughness(df: pd.DataFrame, race_info: dict) -> dict:
+    if df.empty or len(df) < 3:
+        return {
+            "label": "判定不可",
+            "stars": "☆☆☆☆☆",
+            "score": 0,
+            "comment": "データ不足",
+        }
+
+    top = float(df.iloc[0]["AI指数"])
+    second = float(df.iloc[1]["AI指数"])
+    third = float(df.iloc[2]["AI指数"])
+
+    gap1 = top - second
+    gap2 = second - third
+
+    road = race_info.get("走路", "")
+    weather = race_info.get("天候", "")
+    humidity = float(race_info.get("湿度", 0) or 0)
+
+    trial_values = df["試走T"].dropna()
+    trial_gap = float(trial_values.max() - trial_values.min()) if len(trial_values) else 0
+
+    score = 0
+
+    # 指数差が小さいほど荒れ
+    if gap1 < 8:
+        score += 35
+    elif gap1 < 15:
+        score += 25
+    elif gap1 < 30:
+        score += 15
+    elif gap1 < 45:
+        score += 8
+    else:
+        score += 2
+
+    if gap2 < 5:
+        score += 10
+
+    # 走路・天候
+    if road == "湿走路":
+        score += 30
+    elif road == "斑走路":
+        score += 25
+    elif road == "風走路":
+        score += 18
+    elif road == "良走路":
+        score += 5
+
+    if weather in ["雨", "小雨"]:
+        score += 20
+    elif weather == "曇":
+        score += 5
+
+    if humidity >= 80:
+        score += 10
+    elif humidity >= 65:
+        score += 5
+
+    # 試走差が小さい＝混戦
+    if trial_gap <= 0.03:
+        score += 15
+    elif trial_gap <= 0.05:
+        score += 10
+    elif trial_gap <= 0.07:
+        score += 5
+
+    # ヒモ指数とAI指数のズレが大きいと3着荒れ
+    ai_top4 = set([int(x) for x in df.head(4)["車番"].tolist()])
+    himo_top4 = set([int(x) for x in df.sort_values("3着ヒモ指数", ascending=False).head(4)["車番"].tolist()])
+    mismatch = len(himo_top4 - ai_top4)
+    score += mismatch * 6
+
+    score = min(score, 100)
+
+    if score >= 80:
+        label = "超荒れ"
+        stars = "★★★★★"
+        comment = "荒れ要素がかなり強いです。穴・抑え厚め。"
+    elif score >= 60:
+        label = "荒れ"
+        stars = "★★★★☆"
+        comment = "荒れやすい条件です。ヒモ抜け注意。"
+    elif score >= 40:
+        label = "普通"
+        stars = "★★★☆☆"
+        comment = "本線も穴もバランス型。"
+    elif score >= 20:
+        label = "堅め"
+        stars = "★★☆☆☆"
+        comment = "上位中心でよさそうです。"
+    else:
+        label = "超本命"
+        stars = "★☆☆☆☆"
+        comment = "かなり本命寄りです。点数絞り向き。"
+
+    return {
+        "label": label,
+        "stars": stars,
+        "score": round(score, 1),
+        "comment": comment,
+        "gap1": round(gap1, 2),
+        "trial_gap": round(trial_gap, 3),
+    }
+
+
 def unique_keep_order(items):
     seen = set()
     result = []
@@ -605,38 +748,6 @@ def make_3rentan_predictions(df: pd.DataFrame, honsen_n: int, ana_n: int, osae_n
     return honsen, ana, osae
 
 
-def calc_confidence(df: pd.DataFrame) -> dict:
-    if df.empty or len(df) < 2:
-        return {"label": "判定不可", "stars": "☆☆☆☆☆", "comment": "データ不足", "gap": 0}
-
-    top = float(df.iloc[0]["AI指数"])
-    second = float(df.iloc[1]["AI指数"])
-    gap1 = top - second
-
-    if gap1 >= 45:
-        label = "超本命寄り"
-        stars = "★★★★★"
-        comment = "1位の指数が大きく抜けています。ただし3着ヒモ荒れ注意。"
-    elif gap1 >= 30:
-        label = "本命寄り"
-        stars = "★★★★☆"
-        comment = "1位優勢。3着はヒモ指数・前残り・天候を重視。"
-    elif gap1 >= 15:
-        label = "やや本命"
-        stars = "★★★☆☆"
-        comment = "上位拮抗気味。穴も注意。"
-    elif gap1 >= 8:
-        label = "混戦"
-        stars = "★★☆☆☆"
-        comment = "指数差が小さめ。穴・抑えも必要。"
-    else:
-        label = "大混戦"
-        stars = "★☆☆☆☆"
-        comment = "指数差がかなり小さいです。荒れ注意。"
-
-    return {"label": label, "stars": stars, "comment": comment, "gap": round(gap1, 2)}
-
-
 def parse_odds_from_html(html: str, bet_type: str) -> pd.DataFrame:
     text = BeautifulSoup(html, "html.parser").get_text(" ")
     text = clean_text(text)
@@ -722,7 +833,18 @@ def add_odds_to_bets(bets, odds_df: pd.DataFrame, df: pd.DataFrame, bet_type: st
         if odds is None:
             value_score = None
         else:
-            value_score = round(ai_score * odds / 100, 2)
+            raw_value = ai_score * odds / 100
+
+            if odds >= 80:
+                value_score = raw_value * 0.65
+            elif odds >= 50:
+                value_score = raw_value * 0.78
+            elif odds >= 30:
+                value_score = raw_value * 0.90
+            else:
+                value_score = raw_value
+
+            value_score = round(value_score, 2)
 
         rows.append({
             "式別": bet_type,
@@ -745,19 +867,34 @@ def build_value_candidates(df: pd.DataFrame, odds_df: pd.DataFrame, bet_type: st
         bet = row["買い目"]
         odds = float(row["オッズ"])
 
-        # 安すぎる人気は期待値候補から外す
         if odds < 5.0:
             continue
 
+        if odds > max_odds_filter:
+            continue
+
         ai_score = score_bet(bet, df)
-        value_score = ai_score * odds / 100
+
+        if ai_score < min_ai_bet_score:
+            continue
+
+        raw_value = ai_score * odds / 100
+
+        if odds >= 80:
+            adjusted_value = raw_value * 0.65
+        elif odds >= 50:
+            adjusted_value = raw_value * 0.78
+        elif odds >= 30:
+            adjusted_value = raw_value * 0.90
+        else:
+            adjusted_value = raw_value
 
         rows.append({
             "式別": bet_type,
             "買い目": bet,
             "AI買い目指数": round(ai_score, 2),
             "オッズ": odds,
-            "期待値指数": round(value_score, 2),
+            "期待値指数": round(adjusted_value, 2),
         })
 
     out = pd.DataFrame(rows)
@@ -766,7 +903,7 @@ def build_value_candidates(df: pd.DataFrame, odds_df: pd.DataFrame, bet_type: st
         return out
 
     return (
-        out.sort_values("期待値指数", ascending=False)
+        out.sort_values(["期待値指数", "AI買い目指数"], ascending=False)
         .head(limit)
         .reset_index(drop=True)
     )
@@ -807,11 +944,22 @@ if st.button("出走表を取得する", type="primary"):
             st.text_area("取得テキスト確認用", text[:5000], height=300)
         else:
             confidence = calc_confidence(df)
+            roughness = calc_roughness(df, race_info)
 
-            st.subheader("信頼度")
-            st.markdown(f"### {confidence['stars']} {confidence['label']}")
-            st.write(f"指数差：1位 - 2位 = **{confidence['gap']}**")
-            st.write(confidence["comment"])
+            col_conf, col_rough = st.columns(2)
+
+            with col_conf:
+                st.subheader("信頼度")
+                st.markdown(f"### {confidence['stars']} {confidence['label']}")
+                st.write(f"指数差：1位 - 2位 = **{confidence['gap']}**")
+                st.write(confidence["comment"])
+
+            with col_rough:
+                st.subheader("荒れ度AI")
+                st.markdown(f"### {roughness['stars']} {roughness['label']}")
+                st.write(f"荒れ度スコア：**{roughness['score']} / 100**")
+                st.write(f"試走差：**{roughness['trial_gap']}**")
+                st.write(roughness["comment"])
 
             st.subheader("AI指数ランキング")
 
@@ -913,7 +1061,7 @@ if st.button("出走表を取得する", type="primary"):
             st.download_button(
                 "CSVダウンロード",
                 data=csv,
-                file_name="autorace_v2_5_odds_value.csv",
+                file_name="autorace_v2_7_roughness_value.csv",
                 mime="text/csv",
             )
 
