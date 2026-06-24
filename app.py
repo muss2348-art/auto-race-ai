@@ -4,18 +4,23 @@ import pandas as pd
 import streamlit as st
 from bs4 import BeautifulSoup
 
-st.set_page_config(page_title="オートレースAI Mobile v1.9", layout="wide")
+st.set_page_config(page_title="オートレースAI Mobile v2.0", layout="wide")
 
-st.title("🏍️ オートレースAI Mobile v1.9")
-st.caption("WINTICKET出走表取得 + AI指数 + 2連単予想 + 重複排除 + 信頼度")
+st.title("🏍️ オートレースAI Mobile v2.0")
+st.caption("WINTICKET出走表取得 + AI指数 + 2連単/3連単予想")
 
 DEFAULT_URL = "https://www.winticket.jp/autorace/isesaki/racecard/2026062403/1/12"
 
 url = st.text_input("WINTICKET 出走表URL", DEFAULT_URL)
 
-max_honsen = st.slider("🔥本線 点数", 1, 10, 3)
-max_ana = st.slider("🎯穴 点数", 1, 10, 3)
-max_osae = st.slider("🛡️抑え 点数", 1, 10, 3)
+st.sidebar.header("買い目点数")
+max_2_honsen = st.sidebar.slider("2連単 🔥本線", 1, 10, 3)
+max_2_ana = st.sidebar.slider("2連単 🎯穴", 1, 10, 3)
+max_2_osae = st.sidebar.slider("2連単 🛡️抑え", 1, 10, 3)
+
+max_3_honsen = st.sidebar.slider("3連単 🔥本線", 1, 15, 5)
+max_3_ana = st.sidebar.slider("3連単 🎯穴", 1, 15, 4)
+max_3_osae = st.sidebar.slider("3連単 🛡️抑え", 1, 15, 4)
 
 
 def clean_text(text: str) -> str:
@@ -330,39 +335,107 @@ def make_2rentan_predictions(df: pd.DataFrame, honsen_n: int, ana_n: int, osae_n
         return [], [], []
 
     cars = [int(x) for x in df["車番"].tolist()]
-    top_car = cars[0]
-    second_car = cars[1]
+    top = cars[0]
+    second = cars[1]
 
     honsen_raw = []
     ana_raw = []
     osae_raw = []
 
-    # 🔥本線：指数1位を頭に2〜4位へ
     for car in cars[1:5]:
-        honsen_raw.append(f"{top_car}-{car}")
+        honsen_raw.append(f"{top}-{car}")
 
-    # 🎯穴：2位・3位の逆転、2〜4位絡み
-    ana_raw.append(f"{second_car}-{top_car}")
+    ana_raw.append(f"{second}-{top}")
 
     if len(cars) >= 3:
-        third_car = cars[2]
-        ana_raw.append(f"{third_car}-{top_car}")
-        ana_raw.append(f"{second_car}-{third_car}")
-        ana_raw.append(f"{third_car}-{second_car}")
+        third = cars[2]
+        ana_raw.append(f"{third}-{top}")
+        ana_raw.append(f"{second}-{third}")
+        ana_raw.append(f"{third}-{second}")
 
     if len(cars) >= 4:
-        fourth_car = cars[3]
-        ana_raw.append(f"{fourth_car}-{top_car}")
-        ana_raw.append(f"{second_car}-{fourth_car}")
+        fourth = cars[3]
+        ana_raw.append(f"{fourth}-{top}")
+        ana_raw.append(f"{second}-{fourth}")
 
-    # 🛡️抑え：本線・穴で使っていない1位頭の中穴下位
     for car in cars[2:]:
-        osae_raw.append(f"{top_car}-{car}")
+        osae_raw.append(f"{top}-{car}")
 
-    # 念のため下位の逆転も薄く拾う
     if len(cars) >= 5:
-        fifth_car = cars[4]
-        osae_raw.append(f"{fifth_car}-{top_car}")
+        fifth = cars[4]
+        osae_raw.append(f"{fifth}-{top}")
+
+    honsen = unique_keep_order(honsen_raw)[:honsen_n]
+
+    used = set(honsen)
+    ana = remove_used(unique_keep_order(ana_raw), used)[:ana_n]
+
+    used = set(honsen + ana)
+    osae = remove_used(unique_keep_order(osae_raw), used)[:osae_n]
+
+    return honsen, ana, osae
+
+
+def make_3rentan_predictions(df: pd.DataFrame, honsen_n: int, ana_n: int, osae_n: int):
+    if df.empty or len(df) < 3:
+        return [], [], []
+
+    cars = [int(x) for x in df["車番"].tolist()]
+
+    top = cars[0]
+    second = cars[1]
+    third = cars[2]
+    fourth = cars[3] if len(cars) >= 4 else None
+    fifth = cars[4] if len(cars) >= 5 else None
+    sixth = cars[5] if len(cars) >= 6 else None
+
+    honsen_raw = []
+    ana_raw = []
+    osae_raw = []
+
+    # 🔥本線：1位頭固定、2〜4位中心
+    honsen_raw.append(f"{top}-{second}-{third}")
+    honsen_raw.append(f"{top}-{third}-{second}")
+
+    if fourth is not None:
+        honsen_raw.append(f"{top}-{second}-{fourth}")
+        honsen_raw.append(f"{top}-{fourth}-{second}")
+        honsen_raw.append(f"{top}-{third}-{fourth}")
+        honsen_raw.append(f"{top}-{fourth}-{third}")
+
+    # 🎯穴：2位・3位の頭逆転
+    ana_raw.append(f"{second}-{top}-{third}")
+    ana_raw.append(f"{second}-{third}-{top}")
+    ana_raw.append(f"{third}-{top}-{second}")
+    ana_raw.append(f"{third}-{second}-{top}")
+
+    if fourth is not None:
+        ana_raw.append(f"{second}-{top}-{fourth}")
+        ana_raw.append(f"{fourth}-{top}-{second}")
+        ana_raw.append(f"{second}-{fourth}-{top}")
+        ana_raw.append(f"{fourth}-{second}-{top}")
+
+    # 🛡️抑え：1位頭固定＋5位以下絡み
+    if fifth is not None:
+        osae_raw.append(f"{top}-{fifth}-{second}")
+        osae_raw.append(f"{top}-{second}-{fifth}")
+        osae_raw.append(f"{top}-{fifth}-{third}")
+        osae_raw.append(f"{top}-{third}-{fifth}")
+
+    if fourth is not None and fifth is not None:
+        osae_raw.append(f"{top}-{fourth}-{fifth}")
+        osae_raw.append(f"{top}-{fifth}-{fourth}")
+
+    if sixth is not None:
+        osae_raw.append(f"{top}-{sixth}-{second}")
+        osae_raw.append(f"{top}-{second}-{sixth}")
+        osae_raw.append(f"{top}-{sixth}-{third}")
+        osae_raw.append(f"{top}-{third}-{sixth}")
+
+    # 5位の軽い頭逆転
+    if fifth is not None:
+        osae_raw.append(f"{fifth}-{top}-{second}")
+        osae_raw.append(f"{fifth}-{second}-{top}")
 
     honsen = unique_keep_order(honsen_raw)[:honsen_n]
 
@@ -463,11 +536,11 @@ if st.button("出走表を取得する", type="primary"):
 
             st.dataframe(df[show_cols], use_container_width=True)
 
-            honsen, ana, osae = make_2rentan_predictions(
+            h2, a2, o2 = make_2rentan_predictions(
                 df,
-                max_honsen,
-                max_ana,
-                max_osae
+                max_2_honsen,
+                max_2_ana,
+                max_2_osae
             )
 
             st.subheader("2連単予想")
@@ -476,18 +549,44 @@ if st.button("出走表を取得する", type="primary"):
 
             with col1:
                 st.markdown("### 🔥 本線")
-                for b in honsen:
-                    st.write(f"**{b}**")
+                for x in h2:
+                    st.write(f"**{x}**")
 
             with col2:
                 st.markdown("### 🎯 穴")
-                for b in ana:
-                    st.write(f"**{b}**")
+                for x in a2:
+                    st.write(f"**{x}**")
 
             with col3:
                 st.markdown("### 🛡️ 抑え")
-                for b in osae:
-                    st.write(f"**{b}**")
+                for x in o2:
+                    st.write(f"**{x}**")
+
+            h3, a3, o3 = make_3rentan_predictions(
+                df,
+                max_3_honsen,
+                max_3_ana,
+                max_3_osae
+            )
+
+            st.subheader("3連単予想")
+
+            col4, col5, col6 = st.columns(3)
+
+            with col4:
+                st.markdown("### 🔥 本線")
+                for x in h3:
+                    st.write(f"**{x}**")
+
+            with col5:
+                st.markdown("### 🎯 穴")
+                for x in a3:
+                    st.write(f"**{x}**")
+
+            with col6:
+                st.markdown("### 🛡️ 抑え")
+                for x in o3:
+                    st.write(f"**{x}**")
 
             st.subheader("指数詳細")
             detail_cols = [
@@ -506,7 +605,7 @@ if st.button("出走表を取得する", type="primary"):
             st.download_button(
                 "CSVダウンロード",
                 data=csv,
-                file_name="autorace_v1_9_predictions.csv",
+                file_name="autorace_v2_0_predictions.csv",
                 mime="text/csv",
             )
 
