@@ -1,13 +1,14 @@
 import re
+import itertools
 import requests
 import pandas as pd
 import streamlit as st
 from bs4 import BeautifulSoup
 
-st.set_page_config(page_title="オートレースAI Mobile v2.4", layout="wide")
+st.set_page_config(page_title="オートレースAI Mobile v2.5", layout="wide")
 
-st.title("🏍️ オートレースAI Mobile v2.4")
-st.caption("天候取得 + 天候補正 + 同ハンデ比較 + 前残りヒモ強化")
+st.title("🏍️ オートレースAI Mobile v2.5")
+st.caption("天候取得 + AI指数 + ヒモ指数 + 2連単/3連単 + オッズ取得 + 期待値AI")
 
 DEFAULT_URL = "https://www.winticket.jp/autorace/isesaki/racecard/2026062403/1/12"
 
@@ -22,6 +23,9 @@ max_3_honsen = st.sidebar.slider("3連単 🔥本線", 1, 15, 5)
 max_3_ana = st.sidebar.slider("3連単 🎯穴", 1, 15, 4)
 max_3_osae = st.sidebar.slider("3連単 🛡️抑え", 1, 25, 10)
 
+use_odds = st.sidebar.checkbox("オッズ取得を使う", value=True)
+max_value_bets = st.sidebar.slider("期待値AI 表示点数", 3, 20, 8)
+
 
 def clean_text(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
@@ -35,6 +39,15 @@ def fetch_html(url: str) -> str:
     res = requests.get(url, headers=headers, timeout=15)
     res.raise_for_status()
     return res.text
+
+
+def racecard_to_odds_url(url: str) -> str:
+    return url.replace("/racecard/", "/odds/")
+
+
+def fetch_odds_html(url: str) -> str:
+    odds_url = racecard_to_odds_url(url)
+    return fetch_html(odds_url)
 
 
 def extract_race_info(text: str) -> dict:
@@ -52,7 +65,6 @@ def extract_race_info(text: str) -> dict:
     if m:
         info["発走"] = m.group(1)
 
-    # 天候取得
     m = re.search(r"(晴|曇|雨|小雨|雪|小雪)\s+気温", text)
     if m:
         info["天候"] = m.group(1)
@@ -157,10 +169,8 @@ def parse_players(text: str) -> pd.DataFrame:
         })
 
     df = pd.DataFrame(rows)
-
     if not df.empty:
         df = df.sort_values("車番").reset_index(drop=True)
-
     return df
 
 
@@ -273,12 +283,10 @@ def add_same_handicap_bonus(df: pd.DataFrame) -> pd.DataFrame:
 
     def same_bonus(row):
         bonus = 0
-
         h = row["ハンデ数値"]
         trial_rank = row["同ハンデ試走順位"]
         st_rank = row["同ハンデST順位"]
 
-        # 0m・10mは前残りに直結
         if h == 0:
             if trial_rank == 1:
                 bonus += 15
@@ -321,7 +329,6 @@ def add_track_condition_index(df: pd.DataFrame, race_info: dict) -> pd.DataFrame
 
 def add_weather_bonus(df: pd.DataFrame, race_info: dict) -> pd.DataFrame:
     df = df.copy()
-
     weather = race_info.get("天候", "")
     road = race_info.get("走路", "")
 
@@ -330,25 +337,18 @@ def add_weather_bonus(df: pd.DataFrame, race_info: dict) -> pd.DataFrame:
     if weather in ["雨", "小雨"] or road == "湿走路":
         df["天候補正"] += df["湿3連対率"].fillna(0) * 0.10
         df["天候補正"] += df["湿2連対率"].fillna(0) * 0.05
-
     elif weather == "晴" and road == "良走路":
         df["天候補正"] += df["良3連対率"].fillna(0) * 0.04
         df["天候補正"] += df["良2連対率"].fillna(0) * 0.03
-
     elif weather == "曇" and road == "良走路":
-        # 曇りは良走路寄りだが路温が上がりにくいので弱め
         df["天候補正"] += df["良3連対率"].fillna(0) * 0.03
         df["天候補正"] += df["良2連対率"].fillna(0) * 0.02
-
-    else:
-        df["天候補正"] += 0
 
     return df
 
 
 def add_himo_index(df: pd.DataFrame, race_info: dict) -> pd.DataFrame:
     df = df.copy()
-
     road = race_info.get("走路", "")
 
     base_himo = (
@@ -397,7 +397,6 @@ def add_himo_index(df: pd.DataFrame, race_info: dict) -> pd.DataFrame:
         return bonus
 
     keep_bonus = df.apply(start_keep_bonus, axis=1)
-
     df["前残り補正"] = front_bonus + keep_bonus
 
     df["3着ヒモ指数"] = (
@@ -421,7 +420,6 @@ def add_ai_index(df: pd.DataFrame, race_info: dict) -> pd.DataFrame:
         return df
 
     df = df.copy()
-
     df["審査P補正"] = df["審査P"].clip(upper=100)
 
     df["審査Pスコア"] = minmax_score(df["審査P補正"])
@@ -609,12 +607,7 @@ def make_3rentan_predictions(df: pd.DataFrame, honsen_n: int, ana_n: int, osae_n
 
 def calc_confidence(df: pd.DataFrame) -> dict:
     if df.empty or len(df) < 2:
-        return {
-            "label": "判定不可",
-            "stars": "☆☆☆☆☆",
-            "comment": "データ不足",
-            "gap": 0,
-        }
+        return {"label": "判定不可", "stars": "☆☆☆☆☆", "comment": "データ不足", "gap": 0}
 
     top = float(df.iloc[0]["AI指数"])
     second = float(df.iloc[1]["AI指数"])
@@ -641,12 +634,142 @@ def calc_confidence(df: pd.DataFrame) -> dict:
         stars = "★☆☆☆☆"
         comment = "指数差がかなり小さいです。荒れ注意。"
 
-    return {
-        "label": label,
-        "stars": stars,
-        "comment": comment,
-        "gap": round(gap1, 2),
-    }
+    return {"label": label, "stars": stars, "comment": comment, "gap": round(gap1, 2)}
+
+
+def parse_odds_from_html(html: str, bet_type: str) -> pd.DataFrame:
+    text = BeautifulSoup(html, "html.parser").get_text(" ")
+    text = clean_text(text)
+
+    rows = []
+
+    if bet_type == "2連単":
+        pattern = re.findall(
+            r"([1-8])\s*-\s*([1-8])\s+(\d+(?:\.\d+)?)",
+            text
+        )
+        for a, b, odd in pattern:
+            if a != b:
+                rows.append({
+                    "買い目": f"{a}-{b}",
+                    "オッズ": float(odd),
+                    "式別": "2連単",
+                })
+
+    elif bet_type == "3連単":
+        pattern = re.findall(
+            r"([1-8])\s*-\s*([1-8])\s*-\s*([1-8])\s+(\d+(?:\.\d+)?)",
+            text
+        )
+        for a, b, c, odd in pattern:
+            if len({a, b, c}) == 3:
+                rows.append({
+                    "買い目": f"{a}-{b}-{c}",
+                    "オッズ": float(odd),
+                    "式別": "3連単",
+                })
+
+    df = pd.DataFrame(rows)
+
+    if df.empty:
+        return df
+
+    df = (
+        df.sort_values("オッズ")
+        .drop_duplicates("買い目", keep="first")
+        .reset_index(drop=True)
+    )
+
+    return df
+
+
+def build_score_maps(df: pd.DataFrame):
+    ai_map = {int(row["車番"]): float(row["AI指数"]) for _, row in df.iterrows()}
+    himo_map = {int(row["車番"]): float(row["3着ヒモ指数"]) for _, row in df.iterrows()}
+    return ai_map, himo_map
+
+
+def score_bet(bet: str, df: pd.DataFrame) -> float:
+    ai_map, himo_map = build_score_maps(df)
+    nums = [int(x) for x in bet.split("-")]
+
+    if len(nums) == 2:
+        a, b = nums
+        return ai_map.get(a, 0) * 0.60 + ai_map.get(b, 0) * 0.40
+
+    if len(nums) == 3:
+        a, b, c = nums
+        return (
+            ai_map.get(a, 0) * 0.45 +
+            ai_map.get(b, 0) * 0.30 +
+            himo_map.get(c, 0) * 0.25
+        )
+
+    return 0.0
+
+
+def add_odds_to_bets(bets, odds_df: pd.DataFrame, df: pd.DataFrame, bet_type: str) -> pd.DataFrame:
+    rows = []
+
+    odds_map = {}
+    if odds_df is not None and not odds_df.empty:
+        odds_map = dict(zip(odds_df["買い目"], odds_df["オッズ"]))
+
+    for bet in bets:
+        ai_score = score_bet(bet, df)
+        odds = odds_map.get(bet, None)
+
+        if odds is None:
+            value_score = None
+        else:
+            value_score = round(ai_score * odds / 100, 2)
+
+        rows.append({
+            "式別": bet_type,
+            "買い目": bet,
+            "AI買い目指数": round(ai_score, 2),
+            "オッズ": odds,
+            "期待値指数": value_score,
+        })
+
+    return pd.DataFrame(rows)
+
+
+def build_value_candidates(df: pd.DataFrame, odds_df: pd.DataFrame, bet_type: str, limit: int = 8) -> pd.DataFrame:
+    if odds_df is None or odds_df.empty or df.empty:
+        return pd.DataFrame()
+
+    rows = []
+
+    for _, row in odds_df.iterrows():
+        bet = row["買い目"]
+        odds = float(row["オッズ"])
+
+        # 安すぎる人気は期待値候補から外す
+        if odds < 5.0:
+            continue
+
+        ai_score = score_bet(bet, df)
+        value_score = ai_score * odds / 100
+
+        rows.append({
+            "式別": bet_type,
+            "買い目": bet,
+            "AI買い目指数": round(ai_score, 2),
+            "オッズ": odds,
+            "期待値指数": round(value_score, 2),
+        })
+
+    out = pd.DataFrame(rows)
+
+    if out.empty:
+        return out
+
+    return (
+        out.sort_values("期待値指数", ascending=False)
+        .head(limit)
+        .reset_index(drop=True)
+    )
 
 
 if st.button("出走表を取得する", type="primary"):
@@ -660,6 +783,18 @@ if st.button("出走表を取得する", type="primary"):
             df = parse_players(text)
             df = to_numeric_safe(df)
             df = add_ai_index(df, race_info)
+
+        odds_2_df = pd.DataFrame()
+        odds_3_df = pd.DataFrame()
+
+        if use_odds:
+            try:
+                with st.spinner("オッズ取得中..."):
+                    odds_html = fetch_odds_html(url)
+                    odds_2_df = parse_odds_from_html(odds_html, "2連単")
+                    odds_3_df = parse_odds_from_html(odds_html, "3連単")
+            except Exception as odds_error:
+                st.warning(f"オッズ取得に失敗しました：{odds_error}")
 
         st.success(f"取得成功：{len(df)}車")
 
@@ -694,12 +829,8 @@ if st.button("出走表を取得する", type="primary"):
 
             st.dataframe(df[show_cols], use_container_width=True)
 
-            h2, a2, o2 = make_2rentan_predictions(
-                df,
-                max_2_honsen,
-                max_2_ana,
-                max_2_osae
-            )
+            h2, a2, o2 = make_2rentan_predictions(df, max_2_honsen, max_2_ana, max_2_osae)
+            h3, a3, o3 = make_3rentan_predictions(df, max_3_honsen, max_3_ana, max_3_osae)
 
             st.subheader("2連単予想")
 
@@ -707,25 +838,15 @@ if st.button("出走表を取得する", type="primary"):
 
             with col1:
                 st.markdown("### 🔥 本線")
-                for x in h2:
-                    st.write(f"**{x}**")
+                st.dataframe(add_odds_to_bets(h2, odds_2_df, df, "2連単"), use_container_width=True)
 
             with col2:
                 st.markdown("### 🎯 穴")
-                for x in a2:
-                    st.write(f"**{x}**")
+                st.dataframe(add_odds_to_bets(a2, odds_2_df, df, "2連単"), use_container_width=True)
 
             with col3:
                 st.markdown("### 🛡️ 抑え")
-                for x in o2:
-                    st.write(f"**{x}**")
-
-            h3, a3, o3 = make_3rentan_predictions(
-                df,
-                max_3_honsen,
-                max_3_ana,
-                max_3_osae
-            )
+                st.dataframe(add_odds_to_bets(o2, odds_2_df, df, "2連単"), use_container_width=True)
 
             st.subheader("3連単予想")
 
@@ -733,18 +854,45 @@ if st.button("出走表を取得する", type="primary"):
 
             with col4:
                 st.markdown("### 🔥 本線")
-                for x in h3:
-                    st.write(f"**{x}**")
+                st.dataframe(add_odds_to_bets(h3, odds_3_df, df, "3連単"), use_container_width=True)
 
             with col5:
                 st.markdown("### 🎯 穴")
-                for x in a3:
-                    st.write(f"**{x}**")
+                st.dataframe(add_odds_to_bets(a3, odds_3_df, df, "3連単"), use_container_width=True)
 
             with col6:
                 st.markdown("### 🛡️ 抑え")
-                for x in o3:
-                    st.write(f"**{x}**")
+                st.dataframe(add_odds_to_bets(o3, odds_3_df, df, "3連単"), use_container_width=True)
+
+            if use_odds:
+                st.subheader("期待値AI")
+
+                col7, col8 = st.columns(2)
+
+                with col7:
+                    st.markdown("### 2連単 期待値")
+                    value_2 = build_value_candidates(df, odds_2_df, "2連単", max_value_bets)
+                    if value_2.empty:
+                        st.info("2連単オッズを取得できないか、期待値候補がありません。")
+                    else:
+                        st.dataframe(value_2, use_container_width=True)
+
+                with col8:
+                    st.markdown("### 3連単 期待値")
+                    value_3 = build_value_candidates(df, odds_3_df, "3連単", max_value_bets)
+                    if value_3.empty:
+                        st.info("3連単オッズを取得できないか、期待値候補がありません。")
+                    else:
+                        st.dataframe(value_3, use_container_width=True)
+
+                with st.expander("取得オッズ確認"):
+                    st.write("2連単オッズ取得件数:", len(odds_2_df))
+                    if not odds_2_df.empty:
+                        st.dataframe(odds_2_df.head(50), use_container_width=True)
+
+                    st.write("3連単オッズ取得件数:", len(odds_3_df))
+                    if not odds_3_df.empty:
+                        st.dataframe(odds_3_df.head(50), use_container_width=True)
 
             st.subheader("3着ヒモ指数ランキング")
             himo_view = df.sort_values("3着ヒモ指数", ascending=False)
@@ -761,26 +909,11 @@ if st.button("出走表を取得する", type="primary"):
                 use_container_width=True
             )
 
-            st.subheader("指数詳細")
-            detail_cols = [
-                "車番", "選手名",
-                "審査Pスコア", "試走Tスコア", "STスコア",
-                "2連対スコア", "3連対スコア",
-                "ハンデスコア", "ランク補正",
-                "試走順位", "試走順位補正",
-                "良走路指数", "湿走路指数",
-                "走路補正",
-                "3着ヒモ指数", "ヒモ順位",
-                "前残り補正", "同ハンデ補正", "天候補正",
-                "基礎AI指数", "AI指数",
-            ]
-            st.dataframe(df[detail_cols], use_container_width=True)
-
             csv = df.to_csv(index=False).encode("utf-8-sig")
             st.download_button(
                 "CSVダウンロード",
                 data=csv,
-                file_name="autorace_v2_4_weather_same_handicap.csv",
+                file_name="autorace_v2_5_odds_value.csv",
                 mime="text/csv",
             )
 
