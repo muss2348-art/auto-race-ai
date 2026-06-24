@@ -4,16 +4,18 @@ import pandas as pd
 import streamlit as st
 from bs4 import BeautifulSoup
 
-st.set_page_config(page_title="オートレースAI Mobile v2.7", layout="wide")
+st.set_page_config(page_title="オートレースAI Mobile v2.8", layout="wide")
 
-st.title("🏍️ オートレースAI Mobile v2.7")
-st.caption("AI指数 + ヒモ指数 + 天候補正 + オッズ期待値 + 期待値暴走防止 + 荒れ度AI")
+st.title("🏍️ オートレースAI Mobile v2.8")
+st.caption("荒れ度AI連動・買い目点数自動調整版")
 
 DEFAULT_URL = "https://www.winticket.jp/autorace/isesaki/racecard/2026062403/1/12"
 
 url = st.text_input("WINTICKET 出走表URL", DEFAULT_URL)
 
 st.sidebar.header("買い目点数")
+auto_points = st.sidebar.checkbox("荒れ度AIで点数を自動調整", value=True)
+
 max_2_honsen = st.sidebar.slider("2連単 🔥本線", 1, 10, 3)
 max_2_ana = st.sidebar.slider("2連単 🎯穴", 1, 10, 3)
 max_2_osae = st.sidebar.slider("2連単 🛡️抑え", 1, 10, 3)
@@ -48,8 +50,7 @@ def racecard_to_odds_url(url: str) -> str:
 
 
 def fetch_odds_html(url: str) -> str:
-    odds_url = racecard_to_odds_url(url)
-    return fetch_html(odds_url)
+    return fetch_html(racecard_to_odds_url(url))
 
 
 def extract_race_info(text: str) -> dict:
@@ -116,11 +117,6 @@ def parse_players(text: str) -> pd.DataFrame:
         if not base:
             continue
 
-        name = base.group(2).strip()
-        term = base.group(3)
-        age = base.group(4)
-        home = base.group(5)
-
         main = re.search(
             r"(\d+)\s*m\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+"
             r"([ASB]-?\d+|S-\d+)\s*\(\s*([ASB]-?\d+|S-\d+)\s*\)",
@@ -150,10 +146,10 @@ def parse_players(text: str) -> pd.DataFrame:
 
         rows.append({
             "車番": int(car_no),
-            "選手名": name,
-            "期": term,
-            "年齢": int(age),
-            "所属": home,
+            "選手名": base.group(2).strip(),
+            "期": base.group(3),
+            "年齢": int(base.group(4)),
+            "所属": base.group(5),
             "ハンデ": handicap,
             "ハンデ数値": handicap_num,
             "ST": st_time,
@@ -180,8 +176,7 @@ def parse_players(text: str) -> pd.DataFrame:
 def to_numeric_safe(df: pd.DataFrame) -> pd.DataFrame:
     cols = [
         "ハンデ数値", "ST", "試走T", "偏差", "審査P",
-        "2連対率", "3連対率",
-        "良2連対率", "良3連対率",
+        "2連対率", "3連対率", "良2連対率", "良3連対率",
         "湿2連対率", "湿3連対率",
     ]
     for col in cols:
@@ -192,7 +187,6 @@ def to_numeric_safe(df: pd.DataFrame) -> pd.DataFrame:
 
 def minmax_score(series: pd.Series, reverse: bool = False) -> pd.Series:
     s = pd.to_numeric(series, errors="coerce")
-
     if s.isna().all():
         return pd.Series([50.0] * len(s), index=s.index)
 
@@ -504,12 +498,7 @@ def calc_confidence(df: pd.DataFrame) -> dict:
 
 def calc_roughness(df: pd.DataFrame, race_info: dict) -> dict:
     if df.empty or len(df) < 3:
-        return {
-            "label": "判定不可",
-            "stars": "☆☆☆☆☆",
-            "score": 0,
-            "comment": "データ不足",
-        }
+        return {"label": "判定不可", "stars": "☆☆☆☆☆", "score": 0, "comment": "データ不足"}
 
     top = float(df.iloc[0]["AI指数"])
     second = float(df.iloc[1]["AI指数"])
@@ -527,7 +516,6 @@ def calc_roughness(df: pd.DataFrame, race_info: dict) -> dict:
 
     score = 0
 
-    # 指数差が小さいほど荒れ
     if gap1 < 8:
         score += 35
     elif gap1 < 15:
@@ -542,7 +530,6 @@ def calc_roughness(df: pd.DataFrame, race_info: dict) -> dict:
     if gap2 < 5:
         score += 10
 
-    # 走路・天候
     if road == "湿走路":
         score += 30
     elif road == "斑走路":
@@ -562,7 +549,6 @@ def calc_roughness(df: pd.DataFrame, race_info: dict) -> dict:
     elif humidity >= 65:
         score += 5
 
-    # 試走差が小さい＝混戦
     if trial_gap <= 0.03:
         score += 15
     elif trial_gap <= 0.05:
@@ -570,7 +556,6 @@ def calc_roughness(df: pd.DataFrame, race_info: dict) -> dict:
     elif trial_gap <= 0.07:
         score += 5
 
-    # ヒモ指数とAI指数のズレが大きいと3着荒れ
     ai_top4 = set([int(x) for x in df.head(4)["車番"].tolist()])
     himo_top4 = set([int(x) for x in df.sort_values("3着ヒモ指数", ascending=False).head(4)["車番"].tolist()])
     mismatch = len(himo_top4 - ai_top4)
@@ -607,6 +592,61 @@ def calc_roughness(df: pd.DataFrame, race_info: dict) -> dict:
         "gap1": round(gap1, 2),
         "trial_gap": round(trial_gap, 3),
     }
+
+
+def adjust_points_by_roughness(roughness: dict, manual: dict, auto: bool) -> dict:
+    if not auto:
+        return manual
+
+    score = roughness.get("score", 0)
+
+    adjusted = manual.copy()
+
+    if score >= 80:
+        # 超荒れ：穴・抑え厚め
+        adjusted["2_honsen"] = max(2, manual["2_honsen"] - 1)
+        adjusted["2_ana"] = min(10, manual["2_ana"] + 3)
+        adjusted["2_osae"] = min(10, manual["2_osae"] + 3)
+
+        adjusted["3_honsen"] = max(3, manual["3_honsen"] - 1)
+        adjusted["3_ana"] = min(15, manual["3_ana"] + 5)
+        adjusted["3_osae"] = min(25, manual["3_osae"] + 8)
+
+    elif score >= 60:
+        # 荒れ：穴・抑えやや増
+        adjusted["2_honsen"] = manual["2_honsen"]
+        adjusted["2_ana"] = min(10, manual["2_ana"] + 2)
+        adjusted["2_osae"] = min(10, manual["2_osae"] + 2)
+
+        adjusted["3_honsen"] = manual["3_honsen"]
+        adjusted["3_ana"] = min(15, manual["3_ana"] + 3)
+        adjusted["3_osae"] = min(25, manual["3_osae"] + 5)
+
+    elif score >= 40:
+        # 普通：ほぼ手動通り
+        adjusted = manual.copy()
+
+    elif score >= 20:
+        # 堅め：少し絞る
+        adjusted["2_honsen"] = max(2, manual["2_honsen"])
+        adjusted["2_ana"] = max(1, manual["2_ana"] - 1)
+        adjusted["2_osae"] = max(1, manual["2_osae"] - 1)
+
+        adjusted["3_honsen"] = max(3, manual["3_honsen"] - 1)
+        adjusted["3_ana"] = max(1, manual["3_ana"] - 1)
+        adjusted["3_osae"] = max(2, manual["3_osae"] - 3)
+
+    else:
+        # 超本命：かなり絞る
+        adjusted["2_honsen"] = min(manual["2_honsen"], 2)
+        adjusted["2_ana"] = min(manual["2_ana"], 1)
+        adjusted["2_osae"] = min(manual["2_osae"], 1)
+
+        adjusted["3_honsen"] = min(manual["3_honsen"], 3)
+        adjusted["3_ana"] = min(manual["3_ana"], 1)
+        adjusted["3_osae"] = min(manual["3_osae"], 2)
+
+    return adjusted
 
 
 def unique_keep_order(items):
@@ -755,43 +795,27 @@ def parse_odds_from_html(html: str, bet_type: str) -> pd.DataFrame:
     rows = []
 
     if bet_type == "2連単":
-        pattern = re.findall(
-            r"([1-8])\s*-\s*([1-8])\s+(\d+(?:\.\d+)?)",
-            text
-        )
+        pattern = re.findall(r"([1-8])\s*-\s*([1-8])\s+(\d+(?:\.\d+)?)", text)
         for a, b, odd in pattern:
             if a != b:
-                rows.append({
-                    "買い目": f"{a}-{b}",
-                    "オッズ": float(odd),
-                    "式別": "2連単",
-                })
+                rows.append({"買い目": f"{a}-{b}", "オッズ": float(odd), "式別": "2連単"})
 
     elif bet_type == "3連単":
-        pattern = re.findall(
-            r"([1-8])\s*-\s*([1-8])\s*-\s*([1-8])\s+(\d+(?:\.\d+)?)",
-            text
-        )
+        pattern = re.findall(r"([1-8])\s*-\s*([1-8])\s*-\s*([1-8])\s+(\d+(?:\.\d+)?)", text)
         for a, b, c, odd in pattern:
             if len({a, b, c}) == 3:
-                rows.append({
-                    "買い目": f"{a}-{b}-{c}",
-                    "オッズ": float(odd),
-                    "式別": "3連単",
-                })
+                rows.append({"買い目": f"{a}-{b}-{c}", "オッズ": float(odd), "式別": "3連単"})
 
     df = pd.DataFrame(rows)
 
     if df.empty:
         return df
 
-    df = (
+    return (
         df.sort_values("オッズ")
         .drop_duplicates("買い目", keep="first")
         .reset_index(drop=True)
     )
-
-    return df
 
 
 def build_score_maps(df: pd.DataFrame):
@@ -819,6 +843,21 @@ def score_bet(bet: str, df: pd.DataFrame) -> float:
     return 0.0
 
 
+def adjusted_value_score(ai_score: float, odds: float) -> float:
+    raw_value = ai_score * odds / 100
+
+    if odds >= 80:
+        value_score = raw_value * 0.65
+    elif odds >= 50:
+        value_score = raw_value * 0.78
+    elif odds >= 30:
+        value_score = raw_value * 0.90
+    else:
+        value_score = raw_value
+
+    return round(value_score, 2)
+
+
 def add_odds_to_bets(bets, odds_df: pd.DataFrame, df: pd.DataFrame, bet_type: str) -> pd.DataFrame:
     rows = []
 
@@ -830,21 +869,9 @@ def add_odds_to_bets(bets, odds_df: pd.DataFrame, df: pd.DataFrame, bet_type: st
         ai_score = score_bet(bet, df)
         odds = odds_map.get(bet, None)
 
-        if odds is None:
-            value_score = None
-        else:
-            raw_value = ai_score * odds / 100
-
-            if odds >= 80:
-                value_score = raw_value * 0.65
-            elif odds >= 50:
-                value_score = raw_value * 0.78
-            elif odds >= 30:
-                value_score = raw_value * 0.90
-            else:
-                value_score = raw_value
-
-            value_score = round(value_score, 2)
+        value_score = None
+        if odds is not None:
+            value_score = adjusted_value_score(ai_score, odds)
 
         rows.append({
             "式別": bet_type,
@@ -878,23 +905,12 @@ def build_value_candidates(df: pd.DataFrame, odds_df: pd.DataFrame, bet_type: st
         if ai_score < min_ai_bet_score:
             continue
 
-        raw_value = ai_score * odds / 100
-
-        if odds >= 80:
-            adjusted_value = raw_value * 0.65
-        elif odds >= 50:
-            adjusted_value = raw_value * 0.78
-        elif odds >= 30:
-            adjusted_value = raw_value * 0.90
-        else:
-            adjusted_value = raw_value
-
         rows.append({
             "式別": bet_type,
             "買い目": bet,
             "AI買い目指数": round(ai_score, 2),
             "オッズ": odds,
-            "期待値指数": round(adjusted_value, 2),
+            "期待値指数": adjusted_value_score(ai_score, odds),
         })
 
     out = pd.DataFrame(rows)
@@ -946,6 +962,17 @@ if st.button("出走表を取得する", type="primary"):
             confidence = calc_confidence(df)
             roughness = calc_roughness(df, race_info)
 
+            manual_points = {
+                "2_honsen": max_2_honsen,
+                "2_ana": max_2_ana,
+                "2_osae": max_2_osae,
+                "3_honsen": max_3_honsen,
+                "3_ana": max_3_ana,
+                "3_osae": max_3_osae,
+            }
+
+            points = adjust_points_by_roughness(roughness, manual_points, auto_points)
+
             col_conf, col_rough = st.columns(2)
 
             with col_conf:
@@ -960,6 +987,15 @@ if st.button("出走表を取得する", type="primary"):
                 st.write(f"荒れ度スコア：**{roughness['score']} / 100**")
                 st.write(f"試走差：**{roughness['trial_gap']}**")
                 st.write(roughness["comment"])
+
+            st.subheader("買い目点数")
+            if auto_points:
+                st.info(
+                    f"自動調整ON：2連単 本線{points['2_honsen']} / 穴{points['2_ana']} / 抑え{points['2_osae']}、"
+                    f"3連単 本線{points['3_honsen']} / 穴{points['3_ana']} / 抑え{points['3_osae']}"
+                )
+            else:
+                st.info("自動調整OFF：サイドバー設定どおり")
 
             st.subheader("AI指数ランキング")
 
@@ -977,8 +1013,19 @@ if st.button("出走表を取得する", type="primary"):
 
             st.dataframe(df[show_cols], use_container_width=True)
 
-            h2, a2, o2 = make_2rentan_predictions(df, max_2_honsen, max_2_ana, max_2_osae)
-            h3, a3, o3 = make_3rentan_predictions(df, max_3_honsen, max_3_ana, max_3_osae)
+            h2, a2, o2 = make_2rentan_predictions(
+                df,
+                points["2_honsen"],
+                points["2_ana"],
+                points["2_osae"],
+            )
+
+            h3, a3, o3 = make_3rentan_predictions(
+                df,
+                points["3_honsen"],
+                points["3_ana"],
+                points["3_osae"],
+            )
 
             st.subheader("2連単予想")
 
@@ -1061,7 +1108,7 @@ if st.button("出走表を取得する", type="primary"):
             st.download_button(
                 "CSVダウンロード",
                 data=csv,
-                file_name="autorace_v2_7_roughness_value.csv",
+                file_name="autorace_v2_8_auto_points.csv",
                 mime="text/csv",
             )
 
