@@ -4,10 +4,10 @@ import pandas as pd
 import streamlit as st
 from bs4 import BeautifulSoup
 
-st.set_page_config(page_title="オートレースAI Mobile v2.0", layout="wide")
+st.set_page_config(page_title="オートレースAI Mobile v2.1", layout="wide")
 
-st.title("🏍️ オートレースAI Mobile v2.0")
-st.caption("WINTICKET出走表取得 + AI指数 + 2連単/3連単予想")
+st.title("🏍️ オートレースAI Mobile v2.1")
+st.caption("WINTICKET出走表取得 + AI指数 + 2連単/3連単 + 3着ヒモ荒れ対策")
 
 DEFAULT_URL = "https://www.winticket.jp/autorace/isesaki/racecard/2026062403/1/12"
 
@@ -20,7 +20,7 @@ max_2_osae = st.sidebar.slider("2連単 🛡️抑え", 1, 10, 3)
 
 max_3_honsen = st.sidebar.slider("3連単 🔥本線", 1, 15, 5)
 max_3_ana = st.sidebar.slider("3連単 🎯穴", 1, 15, 4)
-max_3_osae = st.sidebar.slider("3連単 🛡️抑え", 1, 15, 4)
+max_3_osae = st.sidebar.slider("3連単 🛡️抑え", 1, 20, 8)
 
 
 def clean_text(text: str) -> str:
@@ -305,8 +305,8 @@ def add_ai_index(df: pd.DataFrame, race_info: dict) -> pd.DataFrame:
 
     df = df.sort_values("AI指数", ascending=False).reset_index(drop=True)
 
-    marks = ["◎", "○", "▲", "△", "☆", "注", "抑", ""]
-    df["印"] = [marks[i] if i < len(marks) else "" for i in range(len(df))]
+    marks = ["◎", "○", "▲", "△", "☆", "注", "抑", "紐"]
+    df["印"] = [marks[i] if i < len(marks) else "紐" for i in range(len(df))]
 
     return df
 
@@ -387,13 +387,20 @@ def make_3rentan_predictions(df: pd.DataFrame, honsen_n: int, ana_n: int, osae_n
     third = cars[2]
     fourth = cars[3] if len(cars) >= 4 else None
     fifth = cars[4] if len(cars) >= 5 else None
-    sixth = cars[5] if len(cars) >= 6 else None
+
+    # 下位でも3着に絡める候補
+    himo_candidates = cars[4:] if len(cars) >= 5 else []
+    if len(cars) >= 8:
+        # 最下位も3着ヒモとして明示的に拾う
+        bottom = cars[-1]
+        if bottom not in himo_candidates:
+            himo_candidates.append(bottom)
 
     honsen_raw = []
     ana_raw = []
     osae_raw = []
 
-    # 🔥本線：1位頭固定、2〜4位中心
+    # 🔥本線：1位頭固定、上位決着
     honsen_raw.append(f"{top}-{second}-{third}")
     honsen_raw.append(f"{top}-{third}-{second}")
 
@@ -415,24 +422,24 @@ def make_3rentan_predictions(df: pd.DataFrame, honsen_n: int, ana_n: int, osae_n
         ana_raw.append(f"{second}-{fourth}-{top}")
         ana_raw.append(f"{fourth}-{second}-{top}")
 
-    # 🛡️抑え：1位頭固定＋5位以下絡み
-    if fifth is not None:
-        osae_raw.append(f"{top}-{fifth}-{second}")
-        osae_raw.append(f"{top}-{second}-{fifth}")
-        osae_raw.append(f"{top}-{fifth}-{third}")
-        osae_raw.append(f"{top}-{third}-{fifth}")
+    # 🛡️抑え：3着ヒモ荒れ対策
+    # 今回の8-7-2みたいな形を拾う
+    for himo in himo_candidates:
+        if himo not in [top, second]:
+            osae_raw.append(f"{top}-{second}-{himo}")
+        if himo not in [top, third]:
+            osae_raw.append(f"{top}-{third}-{himo}")
+        if himo not in [top, fourth] and fourth is not None:
+            osae_raw.append(f"{top}-{fourth}-{himo}")
 
-    if fourth is not None and fifth is not None:
-        osae_raw.append(f"{top}-{fourth}-{fifth}")
-        osae_raw.append(f"{top}-{fifth}-{fourth}")
+    # ヒモが2着に上がるパターンも少し拾う
+    for himo in himo_candidates:
+        if himo not in [top, second]:
+            osae_raw.append(f"{top}-{himo}-{second}")
+        if himo not in [top, third]:
+            osae_raw.append(f"{top}-{himo}-{third}")
 
-    if sixth is not None:
-        osae_raw.append(f"{top}-{sixth}-{second}")
-        osae_raw.append(f"{top}-{second}-{sixth}")
-        osae_raw.append(f"{top}-{sixth}-{third}")
-        osae_raw.append(f"{top}-{third}-{sixth}")
-
-    # 5位の軽い頭逆転
+    # 5位頭の薄い逆転
     if fifth is not None:
         osae_raw.append(f"{fifth}-{top}-{second}")
         osae_raw.append(f"{fifth}-{second}-{top}")
@@ -459,23 +466,21 @@ def calc_confidence(df: pd.DataFrame) -> dict:
 
     top = float(df.iloc[0]["AI指数"])
     second = float(df.iloc[1]["AI指数"])
-    third = float(df.iloc[2]["AI指数"]) if len(df) >= 3 else second
 
     gap1 = top - second
-    gap2 = second - third
 
     if gap1 >= 45:
         label = "超本命寄り"
         stars = "★★★★★"
-        comment = "1位の指数が大きく抜けています。本線中心。"
+        comment = "1位の指数が大きく抜けています。ただし3着ヒモ荒れ注意。"
     elif gap1 >= 30:
         label = "本命寄り"
         stars = "★★★★☆"
-        comment = "1位優勢。相手選びが重要。"
+        comment = "1位優勢。3着は下位も少し拾います。"
     elif gap1 >= 15:
         label = "やや本命"
         stars = "★★★☆☆"
-        comment = "上位拮抗気味。穴も少し注意。"
+        comment = "上位拮抗気味。穴も注意。"
     elif gap1 >= 8:
         label = "混戦"
         stars = "★★☆☆☆"
@@ -490,7 +495,6 @@ def calc_confidence(df: pd.DataFrame) -> dict:
         "stars": stars,
         "comment": comment,
         "gap": round(gap1, 2),
-        "gap2": round(gap2, 2),
     }
 
 
@@ -605,7 +609,7 @@ if st.button("出走表を取得する", type="primary"):
             st.download_button(
                 "CSVダウンロード",
                 data=csv,
-                file_name="autorace_v2_0_predictions.csv",
+                file_name="autorace_v2_1_himo_predictions.csv",
                 mime="text/csv",
             )
 
