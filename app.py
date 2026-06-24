@@ -4,10 +4,10 @@ import pandas as pd
 import streamlit as st
 from bs4 import BeautifulSoup
 
-st.set_page_config(page_title="オートレースAI Mobile v1.8", layout="wide")
+st.set_page_config(page_title="オートレースAI Mobile v1.9", layout="wide")
 
-st.title("🏍️ オートレースAI Mobile v1.8")
-st.caption("WINTICKET出走表取得 + AI指数 + 2連単買い目生成")
+st.title("🏍️ オートレースAI Mobile v1.9")
+st.caption("WINTICKET出走表取得 + AI指数 + 2連単予想 + 重複排除 + 信頼度")
 
 DEFAULT_URL = "https://www.winticket.jp/autorace/isesaki/racecard/2026062403/1/12"
 
@@ -306,69 +306,119 @@ def add_ai_index(df: pd.DataFrame, race_info: dict) -> pd.DataFrame:
     return df
 
 
+def unique_keep_order(items):
+    seen = set()
+    result = []
+    for x in items:
+        if x not in seen:
+            seen.add(x)
+            result.append(x)
+    return result
+
+
+def remove_used(items, used):
+    result = []
+    for x in items:
+        if x not in used:
+            result.append(x)
+            used.add(x)
+    return result
+
+
 def make_2rentan_predictions(df: pd.DataFrame, honsen_n: int, ana_n: int, osae_n: int):
     if df.empty or len(df) < 2:
         return [], [], []
 
-    top = df.iloc[0]
-    second = df.iloc[1]
-    third = df.iloc[2] if len(df) > 2 else None
-    fourth = df.iloc[3] if len(df) > 3 else None
-    fifth = df.iloc[4] if len(df) > 4 else None
+    cars = [int(x) for x in df["車番"].tolist()]
+    top_car = cars[0]
+    second_car = cars[1]
 
-    cars = df["車番"].tolist()
+    honsen_raw = []
+    ana_raw = []
+    osae_raw = []
 
-    honsen = []
-    ana = []
-    osae = []
+    # 🔥本線：指数1位を頭に2〜4位へ
+    for car in cars[1:5]:
+        honsen_raw.append(f"{top_car}-{car}")
 
-    top_car = int(top["車番"])
-    second_car = int(second["車番"])
+    # 🎯穴：2位・3位の逆転、2〜4位絡み
+    ana_raw.append(f"{second_car}-{top_car}")
 
-    # 🔥本線：1位頭中心
-    for car in cars[1:]:
-        honsen.append(f"{top_car}-{int(car)}")
+    if len(cars) >= 3:
+        third_car = cars[2]
+        ana_raw.append(f"{third_car}-{top_car}")
+        ana_raw.append(f"{second_car}-{third_car}")
+        ana_raw.append(f"{third_car}-{second_car}")
 
-    # 🎯穴：2位・3位の逆転頭
-    ana.append(f"{second_car}-{top_car}")
+    if len(cars) >= 4:
+        fourth_car = cars[3]
+        ana_raw.append(f"{fourth_car}-{top_car}")
+        ana_raw.append(f"{second_car}-{fourth_car}")
 
-    if third is not None:
-        third_car = int(third["車番"])
-        ana.append(f"{third_car}-{top_car}")
-        ana.append(f"{second_car}-{third_car}")
-        ana.append(f"{third_car}-{second_car}")
+    # 🛡️抑え：本線・穴で使っていない1位頭の中穴下位
+    for car in cars[2:]:
+        osae_raw.append(f"{top_car}-{car}")
 
-    if fourth is not None:
-        fourth_car = int(fourth["車番"])
-        ana.append(f"{fourth_car}-{top_car}")
+    # 念のため下位の逆転も薄く拾う
+    if len(cars) >= 5:
+        fifth_car = cars[4]
+        osae_raw.append(f"{fifth_car}-{top_car}")
 
-    # 🛡️抑え：1位から中穴・下位へ
-    if third is not None:
-        osae.append(f"{top_car}-{int(third['車番'])}")
+    honsen = unique_keep_order(honsen_raw)[:honsen_n]
 
-    if fourth is not None:
-        osae.append(f"{top_car}-{int(fourth['車番'])}")
+    used = set(honsen)
+    ana = remove_used(unique_keep_order(ana_raw), used)[:ana_n]
 
-    if fifth is not None:
-        osae.append(f"{top_car}-{int(fifth['車番'])}")
-
-    for car in cars[5:]:
-        osae.append(f"{top_car}-{int(car)}")
-
-    def unique_keep_order(items):
-        seen = set()
-        result = []
-        for x in items:
-            if x not in seen:
-                seen.add(x)
-                result.append(x)
-        return result
-
-    honsen = unique_keep_order(honsen)[:honsen_n]
-    ana = unique_keep_order(ana)[:ana_n]
-    osae = unique_keep_order(osae)[:osae_n]
+    used = set(honsen + ana)
+    osae = remove_used(unique_keep_order(osae_raw), used)[:osae_n]
 
     return honsen, ana, osae
+
+
+def calc_confidence(df: pd.DataFrame) -> dict:
+    if df.empty or len(df) < 2:
+        return {
+            "label": "判定不可",
+            "stars": "☆☆☆☆☆",
+            "comment": "データ不足",
+            "gap": 0,
+        }
+
+    top = float(df.iloc[0]["AI指数"])
+    second = float(df.iloc[1]["AI指数"])
+    third = float(df.iloc[2]["AI指数"]) if len(df) >= 3 else second
+
+    gap1 = top - second
+    gap2 = second - third
+
+    if gap1 >= 45:
+        label = "超本命寄り"
+        stars = "★★★★★"
+        comment = "1位の指数が大きく抜けています。本線中心。"
+    elif gap1 >= 30:
+        label = "本命寄り"
+        stars = "★★★★☆"
+        comment = "1位優勢。相手選びが重要。"
+    elif gap1 >= 15:
+        label = "やや本命"
+        stars = "★★★☆☆"
+        comment = "上位拮抗気味。穴も少し注意。"
+    elif gap1 >= 8:
+        label = "混戦"
+        stars = "★★☆☆☆"
+        comment = "指数差が小さめ。穴・抑えも必要。"
+    else:
+        label = "大混戦"
+        stars = "★☆☆☆☆"
+        comment = "指数差がかなり小さいです。荒れ注意。"
+
+    return {
+        "label": label,
+        "stars": stars,
+        "comment": comment,
+        "gap": round(gap1, 2),
+        "gap2": round(gap2, 2),
+    }
 
 
 if st.button("出走表を取得する", type="primary"):
@@ -393,6 +443,13 @@ if st.button("出走表を取得する", type="primary"):
             st.error("選手データを取得できませんでした。")
             st.text_area("取得テキスト確認用", text[:5000], height=300)
         else:
+            confidence = calc_confidence(df)
+
+            st.subheader("信頼度")
+            st.markdown(f"### {confidence['stars']} {confidence['label']}")
+            st.write(f"指数差：1位 - 2位 = **{confidence['gap']}**")
+            st.write(confidence["comment"])
+
             st.subheader("AI指数ランキング")
 
             show_cols = [
@@ -449,7 +506,7 @@ if st.button("出走表を取得する", type="primary"):
             st.download_button(
                 "CSVダウンロード",
                 data=csv,
-                file_name="autorace_v1_8_predictions.csv",
+                file_name="autorace_v1_9_predictions.csv",
                 mime="text/csv",
             )
 
