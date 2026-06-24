@@ -4,10 +4,10 @@ import pandas as pd
 import streamlit as st
 from bs4 import BeautifulSoup
 
-st.set_page_config(page_title="オートレースAI Mobile v2.3", layout="wide")
+st.set_page_config(page_title="オートレースAI Mobile v2.4", layout="wide")
 
-st.title("🏍️ オートレースAI Mobile v2.3")
-st.caption("AI指数 + 2連単/3連単 + 3着ヒモ指数 + 前残り強化")
+st.title("🏍️ オートレースAI Mobile v2.4")
+st.caption("天候取得 + 天候補正 + 同ハンデ比較 + 前残りヒモ強化")
 
 DEFAULT_URL = "https://www.winticket.jp/autorace/isesaki/racecard/2026062403/1/12"
 
@@ -52,6 +52,16 @@ def extract_race_info(text: str) -> dict:
     if m:
         info["発走"] = m.group(1)
 
+    # 天候取得
+    m = re.search(r"(晴|曇|雨|小雨|雪|小雪)\s+気温", text)
+    if m:
+        info["天候"] = m.group(1)
+    else:
+        for w in ["晴", "曇", "雨", "小雨", "雪", "小雪"]:
+            if w in text:
+                info["天候"] = w
+                break
+
     m = re.search(r"(良走路|湿走路|斑走路|風走路)\s*/\s*([\d.]+)\s*℃", text)
     if m:
         info["走路"] = m.group(1)
@@ -89,7 +99,6 @@ def parse_players(text: str) -> pd.DataFrame:
             r"([1-8])\s+(.+?)\s+(\d+)\s*期\s+(\d+)\s*歳\s+(\S+)\s+",
             block
         )
-
         if not base:
             continue
 
@@ -162,17 +171,14 @@ def to_numeric_safe(df: pd.DataFrame) -> pd.DataFrame:
         "良2連対率", "良3連対率",
         "湿2連対率", "湿3連対率",
     ]
-
     for col in cols:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
-
     return df
 
 
 def minmax_score(series: pd.Series, reverse: bool = False) -> pd.Series:
     s = pd.to_numeric(series, errors="coerce")
-
     if s.isna().all():
         return pd.Series([50.0] * len(s), index=s.index)
 
@@ -248,6 +254,51 @@ def add_trial_rank_bonus(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def add_same_handicap_bonus(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df["同ハンデ試走順位"] = 0
+    df["同ハンデST順位"] = 0
+    df["同ハンデ補正"] = 0.0
+
+    for h in sorted(df["ハンデ数値"].dropna().unique()):
+        idx = df[df["ハンデ数値"] == h].index
+
+        if len(idx) <= 1:
+            df.loc[idx, "同ハンデ試走順位"] = 1
+            df.loc[idx, "同ハンデST順位"] = 1
+            continue
+
+        df.loc[idx, "同ハンデ試走順位"] = df.loc[idx, "試走T"].rank(method="min", ascending=True)
+        df.loc[idx, "同ハンデST順位"] = df.loc[idx, "ST"].rank(method="min", ascending=True)
+
+    def same_bonus(row):
+        bonus = 0
+
+        h = row["ハンデ数値"]
+        trial_rank = row["同ハンデ試走順位"]
+        st_rank = row["同ハンデST順位"]
+
+        # 0m・10mは前残りに直結
+        if h == 0:
+            if trial_rank == 1:
+                bonus += 15
+            if st_rank == 1:
+                bonus += 10
+        elif h == 10:
+            if trial_rank == 1:
+                bonus += 8
+            if st_rank == 1:
+                bonus += 5
+        else:
+            if trial_rank == 1:
+                bonus += 3
+
+        return bonus
+
+    df["同ハンデ補正"] = df.apply(same_bonus, axis=1)
+    return df
+
+
 def add_track_condition_index(df: pd.DataFrame, race_info: dict) -> pd.DataFrame:
     df = df.copy()
 
@@ -264,6 +315,33 @@ def add_track_condition_index(df: pd.DataFrame, race_info: dict) -> pd.DataFrame
         df["走路補正"] = df["良走路指数"] * 0.05 + df["湿走路指数"] * 0.08
     else:
         df["走路補正"] = 0
+
+    return df
+
+
+def add_weather_bonus(df: pd.DataFrame, race_info: dict) -> pd.DataFrame:
+    df = df.copy()
+
+    weather = race_info.get("天候", "")
+    road = race_info.get("走路", "")
+
+    df["天候補正"] = 0.0
+
+    if weather in ["雨", "小雨"] or road == "湿走路":
+        df["天候補正"] += df["湿3連対率"].fillna(0) * 0.10
+        df["天候補正"] += df["湿2連対率"].fillna(0) * 0.05
+
+    elif weather == "晴" and road == "良走路":
+        df["天候補正"] += df["良3連対率"].fillna(0) * 0.04
+        df["天候補正"] += df["良2連対率"].fillna(0) * 0.03
+
+    elif weather == "曇" and road == "良走路":
+        # 曇りは良走路寄りだが路温が上がりにくいので弱め
+        df["天候補正"] += df["良3連対率"].fillna(0) * 0.03
+        df["天候補正"] += df["良2連対率"].fillna(0) * 0.02
+
+    else:
+        df["天候補正"] += 0
 
     return df
 
@@ -286,10 +364,7 @@ def add_himo_index(df: pd.DataFrame, race_info: dict) -> pd.DataFrame:
     elif road == "湿走路":
         road_himo = df["湿3連対率"].fillna(0) * 0.30
     elif road == "斑走路":
-        road_himo = (
-            df["良3連対率"].fillna(0) * 0.10 +
-            df["湿3連対率"].fillna(0) * 0.20
-        )
+        road_himo = df["良3連対率"].fillna(0) * 0.10 + df["湿3連対率"].fillna(0) * 0.20
     else:
         road_himo = 0
 
@@ -309,16 +384,13 @@ def add_himo_index(df: pd.DataFrame, race_info: dict) -> pd.DataFrame:
 
     def start_keep_bonus(row):
         bonus = 0
-
         h = row.get("ハンデ数値", None)
         st = row.get("ST", None)
 
         if pd.notna(h) and h == 0:
             bonus += 10
-
         if pd.notna(st) and st <= 0.18:
             bonus += 5
-
         if pd.notna(h) and h == 10 and pd.notna(st) and st <= 0.15:
             bonus += 3
 
@@ -333,7 +405,9 @@ def add_himo_index(df: pd.DataFrame, race_info: dict) -> pd.DataFrame:
         road_himo +
         trial_himo +
         st_himo +
-        df["前残り補正"]
+        df["前残り補正"] +
+        df["同ハンデ補正"] +
+        df["天候補正"]
     )
 
     df["3着ヒモ指数"] = df["3着ヒモ指数"].round(2)
@@ -359,7 +433,9 @@ def add_ai_index(df: pd.DataFrame, race_info: dict) -> pd.DataFrame:
     df["ランク補正"] = df["現ランク"].apply(rank_bonus)
 
     df = add_trial_rank_bonus(df)
+    df = add_same_handicap_bonus(df)
     df = add_track_condition_index(df, race_info)
+    df = add_weather_bonus(df, race_info)
 
     df["基礎AI指数"] = (
         df["審査Pスコア"] * 0.25 +
@@ -371,7 +447,12 @@ def add_ai_index(df: pd.DataFrame, race_info: dict) -> pd.DataFrame:
         df["ランク補正"] * 0.05
     )
 
-    df["AI指数"] = df["基礎AI指数"] + df["走路補正"] + df["試走順位補正"]
+    df["AI指数"] = (
+        df["基礎AI指数"] +
+        df["走路補正"] +
+        df["試走順位補正"] +
+        df["天候補正"] * 0.20
+    )
 
     df = add_himo_index(df, race_info)
 
@@ -466,9 +547,9 @@ def make_3rentan_predictions(df: pd.DataFrame, honsen_n: int, ana_n: int, osae_n
     himo_candidates = [int(x) for x in himo_sorted["車番"].tolist()]
 
     front_candidates = [
-        int(x)
-        for x in df.sort_values("車番")["車番"].tolist()
-        if int(df.loc[df["車番"] == x, "ハンデ数値"].iloc[0]) in [0, 10]
+        int(row["車番"])
+        for _, row in df.iterrows()
+        if row["ハンデ数値"] in [0, 10]
     ]
 
     merged_himo = unique_keep_order(himo_candidates[:6] + front_candidates)
@@ -497,10 +578,7 @@ def make_3rentan_predictions(df: pd.DataFrame, honsen_n: int, ana_n: int, osae_n
         ana_raw.append(f"{second}-{fourth}-{top}")
         ana_raw.append(f"{fourth}-{second}-{top}")
 
-    main_pairs = [
-        (top, second),
-        (top, third),
-    ]
+    main_pairs = [(top, second), (top, third)]
 
     if fourth is not None:
         main_pairs.append((top, fourth))
@@ -549,7 +627,7 @@ def calc_confidence(df: pd.DataFrame) -> dict:
     elif gap1 >= 30:
         label = "本命寄り"
         stars = "★★★★☆"
-        comment = "1位優勢。3着はヒモ指数と前残りを重視。"
+        comment = "1位優勢。3着はヒモ指数・前残り・天候を重視。"
     elif gap1 >= 15:
         label = "やや本命"
         stars = "★★★☆☆"
@@ -604,11 +682,13 @@ if st.button("出走表を取得する", type="primary"):
 
             show_cols = [
                 "印", "車番", "選手名", "ハンデ", "ST", "試走T",
-                "試走順位", "審査P", "現ランク",
+                "試走順位", "同ハンデ試走順位", "同ハンデST順位",
+                "審査P", "現ランク",
                 "2連対率", "3連対率",
                 "良2連対率", "良3連対率",
                 "湿2連対率", "湿3連対率",
-                "3着ヒモ指数", "ヒモ順位", "前残り補正",
+                "3着ヒモ指数", "ヒモ順位",
+                "前残り補正", "同ハンデ補正", "天候補正",
                 "走路補正", "試走順位補正", "基礎AI指数", "AI指数",
             ]
 
@@ -670,7 +750,13 @@ if st.button("出走表を取得する", type="primary"):
             himo_view = df.sort_values("3着ヒモ指数", ascending=False)
             st.dataframe(
                 himo_view[
-                    ["車番", "選手名", "ハンデ", "ST", "3着ヒモ指数", "ヒモ順位", "前残り補正", "AI指数", "印"]
+                    [
+                        "車番", "選手名", "ハンデ", "ST", "試走T",
+                        "同ハンデ試走順位", "同ハンデST順位",
+                        "3着ヒモ指数", "ヒモ順位",
+                        "前残り補正", "同ハンデ補正", "天候補正",
+                        "AI指数", "印"
+                    ]
                 ],
                 use_container_width=True
             )
@@ -684,7 +770,8 @@ if st.button("出走表を取得する", type="primary"):
                 "試走順位", "試走順位補正",
                 "良走路指数", "湿走路指数",
                 "走路補正",
-                "3着ヒモ指数", "ヒモ順位", "前残り補正",
+                "3着ヒモ指数", "ヒモ順位",
+                "前残り補正", "同ハンデ補正", "天候補正",
                 "基礎AI指数", "AI指数",
             ]
             st.dataframe(df[detail_cols], use_container_width=True)
@@ -693,7 +780,7 @@ if st.button("出走表を取得する", type="primary"):
             st.download_button(
                 "CSVダウンロード",
                 data=csv,
-                file_name="autorace_v2_3_front_himo.csv",
+                file_name="autorace_v2_4_weather_same_handicap.csv",
                 mime="text/csv",
             )
 
