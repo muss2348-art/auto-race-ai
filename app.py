@@ -4,19 +4,22 @@ import pandas as pd
 import streamlit as st
 from bs4 import BeautifulSoup
 
-st.set_page_config(page_title="オートレースAI Mobile v1.7", layout="wide")
+st.set_page_config(page_title="オートレースAI Mobile v1.8", layout="wide")
 
-st.title("🏍️ オートレースAI Mobile v1.7")
-st.caption("WINTICKET出走表取得 + AI指数改良版 + 試走補正 + 良/湿走路補正")
+st.title("🏍️ オートレースAI Mobile v1.8")
+st.caption("WINTICKET出走表取得 + AI指数 + 2連単買い目生成")
 
 DEFAULT_URL = "https://www.winticket.jp/autorace/isesaki/racecard/2026062403/1/12"
 
 url = st.text_input("WINTICKET 出走表URL", DEFAULT_URL)
 
+max_honsen = st.slider("🔥本線 点数", 1, 10, 3)
+max_ana = st.slider("🎯穴 点数", 1, 10, 3)
+max_osae = st.slider("🛡️抑え 点数", 1, 10, 3)
+
 
 def clean_text(text: str) -> str:
-    text = re.sub(r"\s+", " ", text)
-    return text.strip()
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def fetch_html(url: str) -> str:
@@ -117,13 +120,6 @@ def parse_players(text: str) -> pd.DataFrame:
 
         rates = re.findall(r"(\d+(?:\.\d+)?)\s*%", block)
 
-        rate_2 = rates[0] if len(rates) > 0 else ""
-        rate_3 = rates[1] if len(rates) > 1 else ""
-        good_2 = rates[2] if len(rates) > 2 else ""
-        good_3 = rates[3] if len(rates) > 3 else ""
-        wet_2 = rates[4] if len(rates) > 4 else ""
-        wet_3 = rates[5] if len(rates) > 5 else ""
-
         rows.append({
             "車番": int(car_no),
             "選手名": name,
@@ -138,12 +134,12 @@ def parse_players(text: str) -> pd.DataFrame:
             "審査P": judge_p,
             "現ランク": current_rank,
             "前ランク": previous_rank,
-            "2連対率": rate_2,
-            "3連対率": rate_3,
-            "良2連対率": good_2,
-            "良3連対率": good_3,
-            "湿2連対率": wet_2,
-            "湿3連対率": wet_3,
+            "2連対率": rates[0] if len(rates) > 0 else "",
+            "3連対率": rates[1] if len(rates) > 1 else "",
+            "良2連対率": rates[2] if len(rates) > 2 else "",
+            "良3連対率": rates[3] if len(rates) > 3 else "",
+            "湿2連対率": rates[4] if len(rates) > 4 else "",
+            "湿3連対率": rates[5] if len(rates) > 5 else "",
         })
 
     df = pd.DataFrame(rows)
@@ -155,21 +151,14 @@ def parse_players(text: str) -> pd.DataFrame:
 
 
 def to_numeric_safe(df: pd.DataFrame) -> pd.DataFrame:
-    num_cols = [
-        "ハンデ数値",
-        "ST",
-        "試走T",
-        "偏差",
-        "審査P",
-        "2連対率",
-        "3連対率",
-        "良2連対率",
-        "良3連対率",
-        "湿2連対率",
-        "湿3連対率",
+    cols = [
+        "ハンデ数値", "ST", "試走T", "偏差", "審査P",
+        "2連対率", "3連対率",
+        "良2連対率", "良3連対率",
+        "湿2連対率", "湿3連対率",
     ]
 
-    for col in num_cols:
+    for col in cols:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
@@ -201,8 +190,7 @@ def handicap_score(handicap: float) -> float:
         return 100
     elif handicap >= 10:
         return 65
-    else:
-        return 40
+    return 40
 
 
 def rank_bonus(rank: str) -> float:
@@ -212,35 +200,32 @@ def rank_bonus(rank: str) -> float:
     if rank.startswith("S-"):
         m = re.search(r"S-(\d+)", rank)
         if m:
-            num = int(m.group(1))
-            if num == 1:
+            n = int(m.group(1))
+            if n == 1:
                 return 20
-            elif num <= 10:
+            elif n <= 10:
                 return 15
-            else:
-                return 12
+            return 12
         return 12
 
     m = re.search(r"A-(\d+)", rank)
     if m:
-        num = int(m.group(1))
-        if num <= 30:
+        n = int(m.group(1))
+        if n <= 30:
             return 9
-        elif num <= 60:
+        elif n <= 60:
             return 7
-        elif num <= 100:
+        elif n <= 100:
             return 5
-        elif num <= 150:
+        elif n <= 150:
             return 3
-        else:
-            return 1
+        return 1
 
     return 0
 
 
 def add_trial_rank_bonus(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-
     df["試走順位"] = df["試走T"].rank(method="min", ascending=True)
 
     def bonus(rank):
@@ -255,22 +240,14 @@ def add_trial_rank_bonus(df: pd.DataFrame) -> pd.DataFrame:
         return 0
 
     df["試走順位補正"] = df["試走順位"].apply(bonus)
-
     return df
 
 
 def add_track_condition_index(df: pd.DataFrame, race_info: dict) -> pd.DataFrame:
     df = df.copy()
 
-    df["良走路指数"] = (
-        df["良2連対率"].fillna(0) * 0.4 +
-        df["良3連対率"].fillna(0) * 0.6
-    )
-
-    df["湿走路指数"] = (
-        df["湿2連対率"].fillna(0) * 0.4 +
-        df["湿3連対率"].fillna(0) * 0.6
-    )
+    df["良走路指数"] = df["良2連対率"].fillna(0) * 0.4 + df["良3連対率"].fillna(0) * 0.6
+    df["湿走路指数"] = df["湿2連対率"].fillna(0) * 0.4 + df["湿3連対率"].fillna(0) * 0.6
 
     road = race_info.get("走路", "")
 
@@ -279,10 +256,7 @@ def add_track_condition_index(df: pd.DataFrame, race_info: dict) -> pd.DataFrame
     elif road == "湿走路":
         df["走路補正"] = df["湿走路指数"] * 0.12
     elif road == "斑走路":
-        df["走路補正"] = (
-            df["良走路指数"] * 0.05 +
-            df["湿走路指数"] * 0.08
-        )
+        df["走路補正"] = df["良走路指数"] * 0.05 + df["湿走路指数"] * 0.08
     else:
         df["走路補正"] = 0
 
@@ -318,32 +292,10 @@ def add_ai_index(df: pd.DataFrame, race_info: dict) -> pd.DataFrame:
         df["ランク補正"] * 0.05
     )
 
-    df["AI指数"] = (
-        df["基礎AI指数"] +
-        df["走路補正"] +
-        df["試走順位補正"]
-    )
+    df["AI指数"] = df["基礎AI指数"] + df["走路補正"] + df["試走順位補正"]
 
-    round_cols = [
-        "審査P補正",
-        "審査Pスコア",
-        "試走Tスコア",
-        "STスコア",
-        "2連対スコア",
-        "3連対スコア",
-        "ハンデスコア",
-        "ランク補正",
-        "試走順位",
-        "試走順位補正",
-        "良走路指数",
-        "湿走路指数",
-        "走路補正",
-        "基礎AI指数",
-        "AI指数",
-    ]
-
-    for col in round_cols:
-        if col in df.columns:
+    for col in df.columns:
+        if pd.api.types.is_numeric_dtype(df[col]):
             df[col] = df[col].round(2)
 
     df = df.sort_values("AI指数", ascending=False).reset_index(drop=True)
@@ -352,6 +304,71 @@ def add_ai_index(df: pd.DataFrame, race_info: dict) -> pd.DataFrame:
     df["印"] = [marks[i] if i < len(marks) else "" for i in range(len(df))]
 
     return df
+
+
+def make_2rentan_predictions(df: pd.DataFrame, honsen_n: int, ana_n: int, osae_n: int):
+    if df.empty or len(df) < 2:
+        return [], [], []
+
+    top = df.iloc[0]
+    second = df.iloc[1]
+    third = df.iloc[2] if len(df) > 2 else None
+    fourth = df.iloc[3] if len(df) > 3 else None
+    fifth = df.iloc[4] if len(df) > 4 else None
+
+    cars = df["車番"].tolist()
+
+    honsen = []
+    ana = []
+    osae = []
+
+    top_car = int(top["車番"])
+    second_car = int(second["車番"])
+
+    # 🔥本線：1位頭中心
+    for car in cars[1:]:
+        honsen.append(f"{top_car}-{int(car)}")
+
+    # 🎯穴：2位・3位の逆転頭
+    ana.append(f"{second_car}-{top_car}")
+
+    if third is not None:
+        third_car = int(third["車番"])
+        ana.append(f"{third_car}-{top_car}")
+        ana.append(f"{second_car}-{third_car}")
+        ana.append(f"{third_car}-{second_car}")
+
+    if fourth is not None:
+        fourth_car = int(fourth["車番"])
+        ana.append(f"{fourth_car}-{top_car}")
+
+    # 🛡️抑え：1位から中穴・下位へ
+    if third is not None:
+        osae.append(f"{top_car}-{int(third['車番'])}")
+
+    if fourth is not None:
+        osae.append(f"{top_car}-{int(fourth['車番'])}")
+
+    if fifth is not None:
+        osae.append(f"{top_car}-{int(fifth['車番'])}")
+
+    for car in cars[5:]:
+        osae.append(f"{top_car}-{int(car)}")
+
+    def unique_keep_order(items):
+        seen = set()
+        result = []
+        for x in items:
+            if x not in seen:
+                seen.add(x)
+                result.append(x)
+        return result
+
+    honsen = unique_keep_order(honsen)[:honsen_n]
+    ana = unique_keep_order(ana)[:ana_n]
+    osae = unique_keep_order(osae)[:osae_n]
+
+    return honsen, ana, osae
 
 
 if st.button("出走表を取得する", type="primary"):
@@ -372,75 +389,69 @@ if st.button("出走表を取得する", type="primary"):
             st.subheader("レース情報")
             st.json(race_info)
 
-        st.subheader("AI指数ランキング")
-
         if df.empty:
-            st.error("選手データを取得できませんでした。HTML構造が変わった可能性があります。")
+            st.error("選手データを取得できませんでした。")
             st.text_area("取得テキスト確認用", text[:5000], height=300)
         else:
+            st.subheader("AI指数ランキング")
+
             show_cols = [
-                "印",
-                "車番",
-                "選手名",
-                "ハンデ",
-                "ST",
-                "試走T",
-                "試走順位",
-                "審査P",
-                "審査P補正",
-                "現ランク",
-                "2連対率",
-                "3連対率",
-                "良2連対率",
-                "良3連対率",
-                "湿2連対率",
-                "湿3連対率",
-                "良走路指数",
-                "湿走路指数",
-                "走路補正",
-                "試走順位補正",
-                "基礎AI指数",
-                "AI指数",
+                "印", "車番", "選手名", "ハンデ", "ST", "試走T",
+                "試走順位", "審査P", "現ランク",
+                "2連対率", "3連対率",
+                "良2連対率", "良3連対率",
+                "湿2連対率", "湿3連対率",
+                "走路補正", "試走順位補正", "基礎AI指数", "AI指数",
             ]
 
             st.dataframe(df[show_cols], use_container_width=True)
 
+            honsen, ana, osae = make_2rentan_predictions(
+                df,
+                max_honsen,
+                max_ana,
+                max_osae
+            )
+
+            st.subheader("2連単予想")
+
+            col1, col2, col3 = st.columns(3)
+
+            with col1:
+                st.markdown("### 🔥 本線")
+                for b in honsen:
+                    st.write(f"**{b}**")
+
+            with col2:
+                st.markdown("### 🎯 穴")
+                for b in ana:
+                    st.write(f"**{b}**")
+
+            with col3:
+                st.markdown("### 🛡️ 抑え")
+                for b in osae:
+                    st.write(f"**{b}**")
+
             st.subheader("指数詳細")
             detail_cols = [
-                "車番",
-                "選手名",
-                "審査Pスコア",
-                "試走Tスコア",
-                "STスコア",
-                "2連対スコア",
-                "3連対スコア",
-                "ハンデスコア",
-                "ランク補正",
-                "試走順位",
-                "試走順位補正",
-                "良走路指数",
-                "湿走路指数",
+                "車番", "選手名",
+                "審査Pスコア", "試走Tスコア", "STスコア",
+                "2連対スコア", "3連対スコア",
+                "ハンデスコア", "ランク補正",
+                "試走順位", "試走順位補正",
+                "良走路指数", "湿走路指数",
                 "走路補正",
-                "基礎AI指数",
-                "AI指数",
+                "基礎AI指数", "AI指数",
             ]
             st.dataframe(df[detail_cols], use_container_width=True)
-
-            st.subheader("簡易印")
-            st.write(df[["印", "車番", "選手名", "AI指数"]])
 
             csv = df.to_csv(index=False).encode("utf-8-sig")
             st.download_button(
                 "CSVダウンロード",
                 data=csv,
-                file_name="autorace_v1_7_ai_index.csv",
+                file_name="autorace_v1_8_predictions.csv",
                 mime="text/csv",
             )
-
-            st.subheader("確認ログ")
-            st.write("取得列：", list(df.columns))
-            st.write("AI指数順：")
-            st.write(df[["印", "車番", "選手名", "基礎AI指数", "走路補正", "試走順位補正", "AI指数"]])
 
     except Exception as e:
         st.error("取得エラー")
