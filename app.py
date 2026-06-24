@@ -4,10 +4,10 @@ import pandas as pd
 import streamlit as st
 from bs4 import BeautifulSoup
 
-st.set_page_config(page_title="オートレースAI Mobile v1.6", layout="wide")
+st.set_page_config(page_title="オートレースAI Mobile v1.7", layout="wide")
 
-st.title("🏍️ オートレースAI Mobile v1.6")
-st.caption("WINTICKET出走表取得 + AI指数 + 良走路/湿走路補正")
+st.title("🏍️ オートレースAI Mobile v1.7")
+st.caption("WINTICKET出走表取得 + AI指数改良版 + 試走補正 + 良/湿走路補正")
 
 DEFAULT_URL = "https://www.winticket.jp/autorace/isesaki/racecard/2026062403/1/12"
 
@@ -36,7 +36,7 @@ def extract_race_info(text: str) -> dict:
     if m:
         info["レース"] = f"{m.group(1)}R"
 
-    m = re.search(r"(GⅠ|GⅡ|GⅢ|SG|G1|G2|G3|一般|特別|優勝戦|予選|準決勝)", text)
+    m = re.search(r"(SG|GⅠ|GⅡ|GⅢ|G1|G2|G3|一般|特別|優勝戦|予選|準決勝)", text)
     if m:
         info["グレード"] = m.group(1)
 
@@ -210,6 +210,15 @@ def rank_bonus(rank: str) -> float:
         return 0
 
     if rank.startswith("S-"):
+        m = re.search(r"S-(\d+)", rank)
+        if m:
+            num = int(m.group(1))
+            if num == 1:
+                return 20
+            elif num <= 10:
+                return 15
+            else:
+                return 12
         return 12
 
     m = re.search(r"A-(\d+)", rank)
@@ -229,6 +238,27 @@ def rank_bonus(rank: str) -> float:
     return 0
 
 
+def add_trial_rank_bonus(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+
+    df["試走順位"] = df["試走T"].rank(method="min", ascending=True)
+
+    def bonus(rank):
+        if pd.isna(rank):
+            return 0
+        if rank == 1:
+            return 10
+        elif rank == 2:
+            return 5
+        elif rank == 3:
+            return 2
+        return 0
+
+    df["試走順位補正"] = df["試走順位"].apply(bonus)
+
+    return df
+
+
 def add_track_condition_index(df: pd.DataFrame, race_info: dict) -> pd.DataFrame:
     df = df.copy()
 
@@ -245,12 +275,12 @@ def add_track_condition_index(df: pd.DataFrame, race_info: dict) -> pd.DataFrame
     road = race_info.get("走路", "")
 
     if road == "良走路":
-        df["走路補正"] = df["良走路指数"] * 0.15
+        df["走路補正"] = df["良走路指数"] * 0.08
     elif road == "湿走路":
-        df["走路補正"] = df["湿走路指数"] * 0.15
+        df["走路補正"] = df["湿走路指数"] * 0.12
     elif road == "斑走路":
         df["走路補正"] = (
-            df["良走路指数"] * 0.08 +
+            df["良走路指数"] * 0.05 +
             df["湿走路指数"] * 0.08
         )
     else:
@@ -265,7 +295,6 @@ def add_ai_index(df: pd.DataFrame, race_info: dict) -> pd.DataFrame:
 
     df = df.copy()
 
-    # 青山周平クラスの審査Pが突出しすぎるため上限カット
     df["審査P補正"] = df["審査P"].clip(upper=100)
 
     df["審査Pスコア"] = minmax_score(df["審査P補正"])
@@ -276,25 +305,46 @@ def add_ai_index(df: pd.DataFrame, race_info: dict) -> pd.DataFrame:
     df["ハンデスコア"] = df["ハンデ数値"].apply(handicap_score)
     df["ランク補正"] = df["現ランク"].apply(rank_bonus)
 
+    df = add_trial_rank_bonus(df)
     df = add_track_condition_index(df, race_info)
 
     df["基礎AI指数"] = (
-        df["審査Pスコア"] * 0.35 +
-        df["試走Tスコア"] * 0.25 +
-        df["2連対スコア"] * 0.15 +
-        df["3連対スコア"] * 0.10 +
-        df["STスコア"] * 0.07 +
+        df["審査Pスコア"] * 0.25 +
+        df["試走Tスコア"] * 0.30 +
+        df["STスコア"] * 0.15 +
+        df["2連対スコア"] * 0.12 +
+        df["3連対スコア"] * 0.08 +
         df["ハンデスコア"] * 0.05 +
-        df["ランク補正"] * 0.03
+        df["ランク補正"] * 0.05
     )
 
-    df["AI指数"] = df["基礎AI指数"] + df["走路補正"]
+    df["AI指数"] = (
+        df["基礎AI指数"] +
+        df["走路補正"] +
+        df["試走順位補正"]
+    )
 
-    df["基礎AI指数"] = df["基礎AI指数"].round(2)
-    df["良走路指数"] = df["良走路指数"].round(2)
-    df["湿走路指数"] = df["湿走路指数"].round(2)
-    df["走路補正"] = df["走路補正"].round(2)
-    df["AI指数"] = df["AI指数"].round(2)
+    round_cols = [
+        "審査P補正",
+        "審査Pスコア",
+        "試走Tスコア",
+        "STスコア",
+        "2連対スコア",
+        "3連対スコア",
+        "ハンデスコア",
+        "ランク補正",
+        "試走順位",
+        "試走順位補正",
+        "良走路指数",
+        "湿走路指数",
+        "走路補正",
+        "基礎AI指数",
+        "AI指数",
+    ]
+
+    for col in round_cols:
+        if col in df.columns:
+            df[col] = df[col].round(2)
 
     df = df.sort_values("AI指数", ascending=False).reset_index(drop=True)
 
@@ -335,6 +385,7 @@ if st.button("出走表を取得する", type="primary"):
                 "ハンデ",
                 "ST",
                 "試走T",
+                "試走順位",
                 "審査P",
                 "審査P補正",
                 "現ランク",
@@ -347,6 +398,7 @@ if st.button("出走表を取得する", type="primary"):
                 "良走路指数",
                 "湿走路指数",
                 "走路補正",
+                "試走順位補正",
                 "基礎AI指数",
                 "AI指数",
             ]
@@ -364,6 +416,8 @@ if st.button("出走表を取得する", type="primary"):
                 "3連対スコア",
                 "ハンデスコア",
                 "ランク補正",
+                "試走順位",
+                "試走順位補正",
                 "良走路指数",
                 "湿走路指数",
                 "走路補正",
@@ -372,18 +426,21 @@ if st.button("出走表を取得する", type="primary"):
             ]
             st.dataframe(df[detail_cols], use_container_width=True)
 
+            st.subheader("簡易印")
+            st.write(df[["印", "車番", "選手名", "AI指数"]])
+
             csv = df.to_csv(index=False).encode("utf-8-sig")
             st.download_button(
                 "CSVダウンロード",
                 data=csv,
-                file_name="autorace_v1_6_ai_index.csv",
+                file_name="autorace_v1_7_ai_index.csv",
                 mime="text/csv",
             )
 
             st.subheader("確認ログ")
             st.write("取得列：", list(df.columns))
             st.write("AI指数順：")
-            st.write(df[["印", "車番", "選手名", "基礎AI指数", "走路補正", "AI指数"]])
+            st.write(df[["印", "車番", "選手名", "基礎AI指数", "走路補正", "試走順位補正", "AI指数"]])
 
     except Exception as e:
         st.error("取得エラー")
