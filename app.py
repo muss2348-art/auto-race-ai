@@ -4,10 +4,10 @@ import pandas as pd
 import streamlit as st
 from bs4 import BeautifulSoup
 
-st.set_page_config(page_title="オートレースAI Mobile v2.1", layout="wide")
+st.set_page_config(page_title="オートレースAI Mobile v2.2", layout="wide")
 
-st.title("🏍️ オートレースAI Mobile v2.1")
-st.caption("WINTICKET出走表取得 + AI指数 + 2連単/3連単 + 3着ヒモ荒れ対策")
+st.title("🏍️ オートレースAI Mobile v2.2")
+st.caption("AI指数 + 2連単/3連単 + 3着ヒモ指数")
 
 DEFAULT_URL = "https://www.winticket.jp/autorace/isesaki/racecard/2026062403/1/12"
 
@@ -20,7 +20,7 @@ max_2_osae = st.sidebar.slider("2連単 🛡️抑え", 1, 10, 3)
 
 max_3_honsen = st.sidebar.slider("3連単 🔥本線", 1, 15, 5)
 max_3_ana = st.sidebar.slider("3連単 🎯穴", 1, 15, 4)
-max_3_osae = st.sidebar.slider("3連単 🛡️抑え", 1, 20, 8)
+max_3_osae = st.sidebar.slider("3連単 🛡️抑え", 1, 25, 10)
 
 
 def clean_text(text: str) -> str:
@@ -268,6 +268,57 @@ def add_track_condition_index(df: pd.DataFrame, race_info: dict) -> pd.DataFrame
     return df
 
 
+def add_himo_index(df: pd.DataFrame, race_info: dict) -> pd.DataFrame:
+    df = df.copy()
+
+    road = race_info.get("走路", "")
+
+    base_himo = (
+        df["3連対率"].fillna(0) * 0.35 +
+        df["良3連対率"].fillna(0) * 0.25 +
+        df["湿3連対率"].fillna(0) * 0.25 +
+        df["2連対率"].fillna(0) * 0.10 +
+        df["良2連対率"].fillna(0) * 0.05
+    )
+
+    if road == "良走路":
+        road_himo = df["良3連対率"].fillna(0) * 0.20
+    elif road == "湿走路":
+        road_himo = df["湿3連対率"].fillna(0) * 0.30
+    elif road == "斑走路":
+        road_himo = (
+            df["良3連対率"].fillna(0) * 0.10 +
+            df["湿3連対率"].fillna(0) * 0.20
+        )
+    else:
+        road_himo = 0
+
+    # 試走が悪すぎない選手は3着残りがある
+    trial_himo = minmax_score(df["試走T"], reverse=True) * 0.08
+
+    # STが悪すぎると1〜2着は厳しいが、3着なら残るケースがあるので弱め
+    st_himo = minmax_score(df["ST"], reverse=True) * 0.04
+
+    # 0m・10mの前残りを3着ヒモで拾う
+    def front_himo_bonus(h):
+        if pd.isna(h):
+            return 0
+        if h == 0:
+            return 8
+        elif h == 10:
+            return 5
+        return 2
+
+    front_bonus = df["ハンデ数値"].apply(front_himo_bonus)
+
+    df["3着ヒモ指数"] = base_himo + road_himo + trial_himo + st_himo + front_bonus
+    df["3着ヒモ指数"] = df["3着ヒモ指数"].round(2)
+
+    df["ヒモ順位"] = df["3着ヒモ指数"].rank(method="min", ascending=False).astype(int)
+
+    return df
+
+
 def add_ai_index(df: pd.DataFrame, race_info: dict) -> pd.DataFrame:
     if df.empty:
         return df
@@ -298,6 +349,8 @@ def add_ai_index(df: pd.DataFrame, race_info: dict) -> pd.DataFrame:
     )
 
     df["AI指数"] = df["基礎AI指数"] + df["走路補正"] + df["試走順位補正"]
+
+    df = add_himo_index(df, race_info)
 
     for col in df.columns:
         if pd.api.types.is_numeric_dtype(df[col]):
@@ -381,26 +434,24 @@ def make_3rentan_predictions(df: pd.DataFrame, honsen_n: int, ana_n: int, osae_n
         return [], [], []
 
     cars = [int(x) for x in df["車番"].tolist()]
-
     top = cars[0]
     second = cars[1]
     third = cars[2]
     fourth = cars[3] if len(cars) >= 4 else None
-    fifth = cars[4] if len(cars) >= 5 else None
 
-    # 下位でも3着に絡める候補
-    himo_candidates = cars[4:] if len(cars) >= 5 else []
-    if len(cars) >= 8:
-        # 最下位も3着ヒモとして明示的に拾う
-        bottom = cars[-1]
-        if bottom not in himo_candidates:
-            himo_candidates.append(bottom)
+    # AI上位
+    top_candidates = cars[:4]
 
+    # 3着ヒモ指数上位
+    himo_sorted = df.sort_values("3着ヒモ指数", ascending=False)
+    himo_candidates = [int(x) for x in himo_sorted["車番"].tolist()]
+
+    # 1〜2着候補はAI上位、3着はヒモ指数優先
     honsen_raw = []
     ana_raw = []
     osae_raw = []
 
-    # 🔥本線：1位頭固定、上位決着
+    # 🔥本線：AI上位決着
     honsen_raw.append(f"{top}-{second}-{third}")
     honsen_raw.append(f"{top}-{third}-{second}")
 
@@ -410,7 +461,7 @@ def make_3rentan_predictions(df: pd.DataFrame, honsen_n: int, ana_n: int, osae_n
         honsen_raw.append(f"{top}-{third}-{fourth}")
         honsen_raw.append(f"{top}-{fourth}-{third}")
 
-    # 🎯穴：2位・3位の頭逆転
+    # 🎯穴：2・3位頭の逆転
     ana_raw.append(f"{second}-{top}-{third}")
     ana_raw.append(f"{second}-{third}-{top}")
     ana_raw.append(f"{third}-{top}-{second}")
@@ -422,27 +473,28 @@ def make_3rentan_predictions(df: pd.DataFrame, honsen_n: int, ana_n: int, osae_n
         ana_raw.append(f"{second}-{fourth}-{top}")
         ana_raw.append(f"{fourth}-{second}-{top}")
 
-    # 🛡️抑え：3着ヒモ荒れ対策
-    # 今回の8-7-2みたいな形を拾う
-    for himo in himo_candidates:
-        if himo not in [top, second]:
-            osae_raw.append(f"{top}-{second}-{himo}")
-        if himo not in [top, third]:
-            osae_raw.append(f"{top}-{third}-{himo}")
-        if himo not in [top, fourth] and fourth is not None:
-            osae_raw.append(f"{top}-{fourth}-{himo}")
+    # 🛡️抑え：3着ヒモ指数から拾う
+    main_first_second = [
+        (top, second),
+        (top, third),
+    ]
 
-    # ヒモが2着に上がるパターンも少し拾う
-    for himo in himo_candidates:
-        if himo not in [top, second]:
+    if fourth is not None:
+        main_first_second.append((top, fourth))
+        main_first_second.append((second, top))
+        main_first_second.append((third, top))
+
+    for first, second_place in main_first_second:
+        for himo in himo_candidates:
+            if himo not in [first, second_place]:
+                osae_raw.append(f"{first}-{second_place}-{himo}")
+
+    # 3着ヒモ上位が2着に来る薄いパターン
+    for himo in himo_candidates[:5]:
+        if himo != top:
             osae_raw.append(f"{top}-{himo}-{second}")
-        if himo not in [top, third]:
+        if himo != top and himo != third:
             osae_raw.append(f"{top}-{himo}-{third}")
-
-    # 5位頭の薄い逆転
-    if fifth is not None:
-        osae_raw.append(f"{fifth}-{top}-{second}")
-        osae_raw.append(f"{fifth}-{second}-{top}")
 
     honsen = unique_keep_order(honsen_raw)[:honsen_n]
 
@@ -466,7 +518,6 @@ def calc_confidence(df: pd.DataFrame) -> dict:
 
     top = float(df.iloc[0]["AI指数"])
     second = float(df.iloc[1]["AI指数"])
-
     gap1 = top - second
 
     if gap1 >= 45:
@@ -476,7 +527,7 @@ def calc_confidence(df: pd.DataFrame) -> dict:
     elif gap1 >= 30:
         label = "本命寄り"
         stars = "★★★★☆"
-        comment = "1位優勢。3着は下位も少し拾います。"
+        comment = "1位優勢。3着はヒモ指数を重視。"
     elif gap1 >= 15:
         label = "やや本命"
         stars = "★★★☆☆"
@@ -535,6 +586,7 @@ if st.button("出走表を取得する", type="primary"):
                 "2連対率", "3連対率",
                 "良2連対率", "良3連対率",
                 "湿2連対率", "湿3連対率",
+                "3着ヒモ指数", "ヒモ順位",
                 "走路補正", "試走順位補正", "基礎AI指数", "AI指数",
             ]
 
@@ -592,6 +644,13 @@ if st.button("出走表を取得する", type="primary"):
                 for x in o3:
                     st.write(f"**{x}**")
 
+            st.subheader("3着ヒモ指数ランキング")
+            himo_view = df.sort_values("3着ヒモ指数", ascending=False)
+            st.dataframe(
+                himo_view[["車番", "選手名", "3着ヒモ指数", "ヒモ順位", "AI指数", "印"]],
+                use_container_width=True
+            )
+
             st.subheader("指数詳細")
             detail_cols = [
                 "車番", "選手名",
@@ -601,6 +660,7 @@ if st.button("出走表を取得する", type="primary"):
                 "試走順位", "試走順位補正",
                 "良走路指数", "湿走路指数",
                 "走路補正",
+                "3着ヒモ指数", "ヒモ順位",
                 "基礎AI指数", "AI指数",
             ]
             st.dataframe(df[detail_cols], use_container_width=True)
@@ -609,7 +669,7 @@ if st.button("出走表を取得する", type="primary"):
             st.download_button(
                 "CSVダウンロード",
                 data=csv,
-                file_name="autorace_v2_1_himo_predictions.csv",
+                file_name="autorace_v2_2_himo_index.csv",
                 mime="text/csv",
             )
 
