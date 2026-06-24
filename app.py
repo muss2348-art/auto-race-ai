@@ -4,10 +4,10 @@ import pandas as pd
 import streamlit as st
 from bs4 import BeautifulSoup
 
-st.set_page_config(page_title="オートレースAI Mobile v1.5", layout="wide")
+st.set_page_config(page_title="オートレースAI Mobile v1.6", layout="wide")
 
-st.title("🏍️ オートレースAI Mobile v1.5")
-st.caption("WINTICKET出走表取得 + AI指数表示")
+st.title("🏍️ オートレースAI Mobile v1.6")
+st.caption("WINTICKET出走表取得 + AI指数 + 良走路/湿走路補正")
 
 DEFAULT_URL = "https://www.winticket.jp/autorace/isesaki/racecard/2026062403/1/12"
 
@@ -36,7 +36,7 @@ def extract_race_info(text: str) -> dict:
     if m:
         info["レース"] = f"{m.group(1)}R"
 
-    m = re.search(r"(GⅠ|GⅡ|GⅢ|SG|G1|G2|G3|G2|一般|特別|優勝戦|予選|準決勝)", text)
+    m = re.search(r"(GⅠ|GⅡ|GⅢ|SG|G1|G2|G3|一般|特別|優勝戦|予選|準決勝)", text)
     if m:
         info["グレード"] = m.group(1)
 
@@ -229,13 +229,46 @@ def rank_bonus(rank: str) -> float:
     return 0
 
 
-def add_ai_index(df: pd.DataFrame) -> pd.DataFrame:
+def add_track_condition_index(df: pd.DataFrame, race_info: dict) -> pd.DataFrame:
+    df = df.copy()
+
+    df["良走路指数"] = (
+        df["良2連対率"].fillna(0) * 0.4 +
+        df["良3連対率"].fillna(0) * 0.6
+    )
+
+    df["湿走路指数"] = (
+        df["湿2連対率"].fillna(0) * 0.4 +
+        df["湿3連対率"].fillna(0) * 0.6
+    )
+
+    road = race_info.get("走路", "")
+
+    if road == "良走路":
+        df["走路補正"] = df["良走路指数"] * 0.15
+    elif road == "湿走路":
+        df["走路補正"] = df["湿走路指数"] * 0.15
+    elif road == "斑走路":
+        df["走路補正"] = (
+            df["良走路指数"] * 0.08 +
+            df["湿走路指数"] * 0.08
+        )
+    else:
+        df["走路補正"] = 0
+
+    return df
+
+
+def add_ai_index(df: pd.DataFrame, race_info: dict) -> pd.DataFrame:
     if df.empty:
         return df
 
     df = df.copy()
 
-    df["審査Pスコア"] = minmax_score(df["審査P"])
+    # 青山周平クラスの審査Pが突出しすぎるため上限カット
+    df["審査P補正"] = df["審査P"].clip(upper=100)
+
+    df["審査Pスコア"] = minmax_score(df["審査P補正"])
     df["試走Tスコア"] = minmax_score(df["試走T"], reverse=True)
     df["STスコア"] = minmax_score(df["ST"], reverse=True)
     df["2連対スコア"] = minmax_score(df["2連対率"])
@@ -243,7 +276,9 @@ def add_ai_index(df: pd.DataFrame) -> pd.DataFrame:
     df["ハンデスコア"] = df["ハンデ数値"].apply(handicap_score)
     df["ランク補正"] = df["現ランク"].apply(rank_bonus)
 
-    df["AI指数"] = (
+    df = add_track_condition_index(df, race_info)
+
+    df["基礎AI指数"] = (
         df["審査Pスコア"] * 0.35 +
         df["試走Tスコア"] * 0.25 +
         df["2連対スコア"] * 0.15 +
@@ -253,6 +288,12 @@ def add_ai_index(df: pd.DataFrame) -> pd.DataFrame:
         df["ランク補正"] * 0.03
     )
 
+    df["AI指数"] = df["基礎AI指数"] + df["走路補正"]
+
+    df["基礎AI指数"] = df["基礎AI指数"].round(2)
+    df["良走路指数"] = df["良走路指数"].round(2)
+    df["湿走路指数"] = df["湿走路指数"].round(2)
+    df["走路補正"] = df["走路補正"].round(2)
     df["AI指数"] = df["AI指数"].round(2)
 
     df = df.sort_values("AI指数", ascending=False).reset_index(drop=True)
@@ -273,7 +314,7 @@ if st.button("出走表を取得する", type="primary"):
             race_info = extract_race_info(text)
             df = parse_players(text)
             df = to_numeric_safe(df)
-            df = add_ai_index(df)
+            df = add_ai_index(df, race_info)
 
         st.success(f"取得成功：{len(df)}車")
 
@@ -295,6 +336,7 @@ if st.button("出走表を取得する", type="primary"):
                 "ST",
                 "試走T",
                 "審査P",
+                "審査P補正",
                 "現ランク",
                 "2連対率",
                 "3連対率",
@@ -302,6 +344,10 @@ if st.button("出走表を取得する", type="primary"):
                 "良3連対率",
                 "湿2連対率",
                 "湿3連対率",
+                "良走路指数",
+                "湿走路指数",
+                "走路補正",
+                "基礎AI指数",
                 "AI指数",
             ]
 
@@ -318,6 +364,10 @@ if st.button("出走表を取得する", type="primary"):
                 "3連対スコア",
                 "ハンデスコア",
                 "ランク補正",
+                "良走路指数",
+                "湿走路指数",
+                "走路補正",
+                "基礎AI指数",
                 "AI指数",
             ]
             st.dataframe(df[detail_cols], use_container_width=True)
@@ -326,14 +376,14 @@ if st.button("出走表を取得する", type="primary"):
             st.download_button(
                 "CSVダウンロード",
                 data=csv,
-                file_name="autorace_v1_5_ai_index.csv",
+                file_name="autorace_v1_6_ai_index.csv",
                 mime="text/csv",
             )
 
             st.subheader("確認ログ")
             st.write("取得列：", list(df.columns))
             st.write("AI指数順：")
-            st.write(df[["印", "車番", "選手名", "AI指数"]])
+            st.write(df[["印", "車番", "選手名", "基礎AI指数", "走路補正", "AI指数"]])
 
     except Exception as e:
         st.error("取得エラー")
