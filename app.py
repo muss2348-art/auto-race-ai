@@ -5,10 +5,10 @@ import pandas as pd
 import streamlit as st
 from bs4 import BeautifulSoup
 
-st.set_page_config(page_title="オートレースAI Mobile v3.0", layout="wide")
+st.set_page_config(page_title="オートレースAI Mobile v4.0", layout="wide")
 
-st.title("🏍️ オートレースAI Mobile v3.0")
-st.caption("買い目生成ロジック一新・指定点数完全一致版")
+st.title("🏍️ オートレースAI Mobile v4.0")
+st.caption("的中率特化版：前残りAI + ヒモAI Ver2 + 期待値反映 + 買い目ランク")
 
 DEFAULT_URL = "https://www.winticket.jp/autorace/isesaki/racecard/2026062403/1/12"
 url = st.text_input("WINTICKET 出走表URL", DEFAULT_URL)
@@ -294,9 +294,9 @@ def add_track_condition_index(df, race_info):
     if road == "良走路":
         df["走路補正"] = df["良走路指数"] * 0.08
     elif road == "湿走路":
-        df["走路補正"] = df["湿走路指数"] * 0.12
+        df["走路補正"] = df["湿走路指数"] * 0.14
     elif road == "斑走路":
-        df["走路補正"] = df["良走路指数"] * 0.05 + df["湿走路指数"] * 0.08
+        df["走路補正"] = df["良走路指数"] * 0.05 + df["湿走路指数"] * 0.10
     else:
         df["走路補正"] = 0
 
@@ -310,8 +310,8 @@ def add_weather_bonus(df, race_info):
     df["天候補正"] = 0.0
 
     if weather in ["雨", "小雨"] or road == "湿走路":
-        df["天候補正"] += df["湿3連対率"].fillna(0) * 0.10
-        df["天候補正"] += df["湿2連対率"].fillna(0) * 0.05
+        df["天候補正"] += df["湿3連対率"].fillna(0) * 0.12
+        df["天候補正"] += df["湿2連対率"].fillna(0) * 0.07
     elif weather == "晴" and road == "良走路":
         df["天候補正"] += df["良3連対率"].fillna(0) * 0.04
         df["天候補正"] += df["良2連対率"].fillna(0) * 0.03
@@ -325,21 +325,22 @@ def add_weather_bonus(df, race_info):
 def add_himo_index(df, race_info):
     df = df.copy()
     road = race_info.get("走路", "")
+    weather = race_info.get("天候", "")
 
     base_himo = (
-        df["3連対率"].fillna(0) * 0.35 +
-        df["良3連対率"].fillna(0) * 0.25 +
-        df["湿3連対率"].fillna(0) * 0.25 +
-        df["2連対率"].fillna(0) * 0.10 +
-        df["良2連対率"].fillna(0) * 0.05
+        df["3連対率"].fillna(0) * 0.28 +
+        df["良3連対率"].fillna(0) * 0.20 +
+        df["湿3連対率"].fillna(0) * 0.24 +
+        df["2連対率"].fillna(0) * 0.08 +
+        df["良2連対率"].fillna(0) * 0.04
     )
 
     if road == "良走路":
-        road_himo = df["良3連対率"].fillna(0) * 0.20
+        road_himo = df["良3連対率"].fillna(0) * 0.18
     elif road == "湿走路":
-        road_himo = df["湿3連対率"].fillna(0) * 0.30
+        road_himo = df["湿3連対率"].fillna(0) * 0.38
     elif road == "斑走路":
-        road_himo = df["良3連対率"].fillna(0) * 0.10 + df["湿3連対率"].fillna(0) * 0.20
+        road_himo = df["良3連対率"].fillna(0) * 0.10 + df["湿3連対率"].fillna(0) * 0.25
     else:
         road_himo = 0
 
@@ -350,9 +351,9 @@ def add_himo_index(df, race_info):
         if pd.isna(h):
             return 0
         if h == 0:
-            return 20
+            return 26
         if h == 10:
-            return 10
+            return 13
         return 0
 
     def keep_bonus(row):
@@ -361,11 +362,11 @@ def add_himo_index(df, race_info):
         stv = row.get("ST", None)
 
         if pd.notna(h) and h == 0:
-            b += 10
+            b += 12
         if pd.notna(stv) and stv <= 0.18:
-            b += 5
+            b += 6
         if pd.notna(h) and h == 10 and pd.notna(stv) and stv <= 0.15:
-            b += 3
+            b += 5
         return b
 
     df["前残り補正"] = df["ハンデ数値"].apply(front_bonus) + df.apply(keep_bonus, axis=1)
@@ -379,6 +380,9 @@ def add_himo_index(df, race_info):
         df["同ハンデ補正"] +
         df["天候補正"]
     )
+
+    if weather in ["雨", "小雨"] or road == "湿走路":
+        df["3着ヒモ指数"] += df["湿3連対率"].fillna(0) * 0.10
 
     df["3着ヒモ指数"] = df["3着ヒモ指数"].round(2)
     df["ヒモ順位"] = df["3着ヒモ指数"].rank(method="min", ascending=False).astype(int)
@@ -407,20 +411,20 @@ def add_ai_index(df, race_info):
     df = add_weather_bonus(df, race_info)
 
     df["基礎AI指数"] = (
-        df["審査Pスコア"] * 0.25 +
-        df["試走Tスコア"] * 0.30 +
+        df["審査Pスコア"] * 0.23 +
+        df["試走Tスコア"] * 0.29 +
         df["STスコア"] * 0.15 +
         df["2連対スコア"] * 0.12 +
-        df["3連対スコア"] * 0.08 +
+        df["3連対スコア"] * 0.09 +
         df["ハンデスコア"] * 0.05 +
-        df["ランク補正"] * 0.05
+        df["ランク補正"] * 0.07
     )
 
     df["AI指数"] = (
         df["基礎AI指数"] +
         df["走路補正"] +
         df["試走順位補正"] +
-        df["天候補正"] * 0.20
+        df["天候補正"] * 0.25
     )
 
     df = add_himo_index(df, race_info)
@@ -456,6 +460,7 @@ def add_simulation(df, n_sim=1000, strength=1.4):
 
     ai = df["AI指数"].fillna(0).astype(float).tolist()
     himo = df["3着ヒモ指数"].fillna(0).astype(float).tolist()
+    front = df["前残り補正"].fillna(0).astype(float).tolist()
 
     first_count = {c: 0 for c in cars}
     second_count = {c: 0 for c in cars}
@@ -471,7 +476,7 @@ def add_simulation(df, n_sim=1000, strength=1.4):
         p2_base = []
         for c in remaining:
             idx = cars.index(c)
-            p2_base.append(ai[idx] * 0.75 + himo[idx] * 0.25)
+            p2_base.append(ai[idx] * 0.70 + himo[idx] * 0.20 + front[idx] * 0.10)
         p2 = softmax(p2_base, strength * 0.9)
         second = int(np.random.choice(remaining, p=p2))
         remaining.remove(second)
@@ -479,7 +484,7 @@ def add_simulation(df, n_sim=1000, strength=1.4):
         p3_base = []
         for c in remaining:
             idx = cars.index(c)
-            p3_base.append(himo[idx] * 0.65 + ai[idx] * 0.35)
+            p3_base.append(himo[idx] * 0.70 + ai[idx] * 0.20 + front[idx] * 0.10)
         p3 = softmax(p3_base, strength * 0.8)
         third = int(np.random.choice(remaining, p=p3))
 
@@ -543,16 +548,16 @@ def calc_roughness(df, race_info):
         score += 10
 
     if road == "湿走路":
-        score += 30
+        score += 34
     elif road == "斑走路":
-        score += 25
+        score += 28
     elif road == "風走路":
         score += 18
     elif road == "良走路":
         score += 5
 
     if weather in ["雨", "小雨"]:
-        score += 20
+        score += 22
     elif weather == "曇":
         score += 5
 
@@ -663,27 +668,30 @@ def score_bet(bet, df):
     sim1_map = {int(r["車番"]): float(r["1着率"]) for _, r in df.iterrows()}
     sim2_map = {int(r["車番"]): float(r["2着率"]) for _, r in df.iterrows()}
     sim3_map = {int(r["車番"]): float(r["3着率"]) for _, r in df.iterrows()}
+    front_map = {int(r["車番"]): float(r["前残り補正"]) for _, r in df.iterrows()}
 
     nums = [int(x) for x in bet.split("-")]
 
     if len(nums) == 2:
         a, b = nums
         return (
-            ai_map.get(a, 0) * 0.35 +
-            ai_map.get(b, 0) * 0.25 +
-            sim1_map.get(a, 0) * 0.25 +
-            sim2_map.get(b, 0) * 0.15
+            ai_map.get(a, 0) * 0.32 +
+            ai_map.get(b, 0) * 0.22 +
+            sim1_map.get(a, 0) * 0.28 +
+            sim2_map.get(b, 0) * 0.15 +
+            front_map.get(b, 0) * 0.03
         )
 
     if len(nums) == 3:
         a, b, c = nums
         return (
-            ai_map.get(a, 0) * 0.30 +
-            ai_map.get(b, 0) * 0.20 +
-            himo_map.get(c, 0) * 0.20 +
+            ai_map.get(a, 0) * 0.27 +
+            ai_map.get(b, 0) * 0.18 +
+            himo_map.get(c, 0) * 0.22 +
             sim1_map.get(a, 0) * 0.15 +
             sim2_map.get(b, 0) * 0.08 +
-            sim3_map.get(c, 0) * 0.07
+            sim3_map.get(c, 0) * 0.07 +
+            front_map.get(c, 0) * 0.03
         )
 
     return 0
@@ -700,6 +708,55 @@ def adjusted_value_score(ai_score, odds):
     return round(raw, 2)
 
 
+def bet_rank(ai_score, odds):
+    if odds is None:
+        odds = 0
+
+    if ai_score >= 95 and odds <= 25:
+        return "S"
+    if ai_score >= 85 and odds <= 40:
+        return "A"
+    if ai_score >= 75 and odds <= 70:
+        return "B"
+    if odds >= 30 and ai_score >= 65:
+        return "穴"
+    if odds >= 70 and ai_score >= 55:
+        return "超穴"
+    return "見送り"
+
+
+def popularity_penalty(odds):
+    if odds is None:
+        return 0
+    if odds < 2.0:
+        return -12
+    if odds < 3.0:
+        return -8
+    if odds < 5.0:
+        return -4
+    return 0
+
+
+def value_boost(ai_score, odds):
+    if odds is None:
+        return 0
+    if odds < 2:
+        return -10
+    if odds <= 15:
+        return odds * 0.25
+    if odds <= 40:
+        return odds * 0.18
+    if odds <= 80:
+        return odds * 0.10
+    return 5
+
+
+def final_bet_score(bet, df, odds_map):
+    base = score_bet(bet, df)
+    odds = odds_map.get(bet, None)
+    return base + value_boost(base, odds) + popularity_penalty(odds)
+
+
 def add_odds_to_bets(bets, odds_df, df, bet_type):
     odds_map = {}
     if odds_df is not None and not odds_df.empty:
@@ -710,9 +767,12 @@ def add_odds_to_bets(bets, odds_df, df, bet_type):
         ai_score = score_bet(bet, df)
         odds = odds_map.get(bet, None)
         value = adjusted_value_score(ai_score, odds) if odds is not None else None
+        rank = bet_rank(ai_score, odds)
+
         rows.append({
             "式別": bet_type,
             "買い目": bet,
+            "評価": rank,
             "AI買い目指数": round(ai_score, 2),
             "オッズ": odds,
             "期待値指数": value,
@@ -740,6 +800,7 @@ def build_value_candidates(df, odds_df, bet_type, limit=8):
         rows.append({
             "式別": bet_type,
             "買い目": bet,
+            "評価": bet_rank(ai_score, odds),
             "AI買い目指数": round(ai_score, 2),
             "オッズ": odds,
             "期待値指数": adjusted_value_score(ai_score, odds),
@@ -787,6 +848,10 @@ def classify_bet(bet, df):
         int(row["車番"]): i + 1
         for i, (_, row) in enumerate(df.sort_values("3着率", ascending=False).iterrows())
     }
+    himo_rank = {
+        int(row["車番"]): i + 1
+        for i, (_, row) in enumerate(df.sort_values("3着ヒモ指数", ascending=False).iterrows())
+    }
 
     if len(nums) == 2:
         a, b = nums
@@ -794,7 +859,7 @@ def classify_bet(bet, df):
         if sim1_rank.get(a, 99) <= 2 and ai_rank.get(b, 99) <= 4:
             return "本線"
 
-        if sim1_rank.get(a, 99) <= 4 and a != df.iloc[0]["車番"]:
+        if sim1_rank.get(a, 99) <= 4 and a != int(df.iloc[0]["車番"]):
             return "穴"
 
         return "抑え"
@@ -808,25 +873,28 @@ def classify_bet(bet, df):
         if sim1_rank.get(a, 99) in [2, 3, 4]:
             return "穴"
 
+        if himo_rank.get(c, 99) <= 5:
+            return "抑え"
+
         return "抑え"
 
     return "抑え"
 
 
-def generate_exact_bets(df, bet_type, honsen_n, ana_n, osae_n):
+def generate_exact_bets(df, bet_type, honsen_n, ana_n, osae_n, odds_df=None):
     all_bets = make_all_bets(df, bet_type)
+
+    odds_map = {}
+    if odds_df is not None and not odds_df.empty:
+        odds_map = dict(zip(odds_df["買い目"], odds_df["オッズ"]))
 
     ranked = sorted(
         all_bets,
-        key=lambda x: score_bet(x, df),
+        key=lambda x: final_bet_score(x, df, odds_map),
         reverse=True
     )
 
-    buckets = {
-        "本線": [],
-        "穴": [],
-        "抑え": [],
-    }
+    buckets = {"本線": [], "穴": [], "抑え": []}
 
     for bet in ranked:
         cat = classify_bet(bet, df)
@@ -857,11 +925,7 @@ def generate_exact_bets(df, bet_type, honsen_n, ana_n, osae_n):
     ana = pick("穴", ana_n)
     osae = pick("抑え", osae_n)
 
-    honsen = honsen[:honsen_n]
-    ana = ana[:ana_n]
-    osae = osae[:osae_n]
-
-    return honsen, ana, osae
+    return honsen[:honsen_n], ana[:ana_n], osae[:osae_n]
 
 
 if st.button("出走表を取得する", type="primary"):
@@ -966,6 +1030,7 @@ if st.button("出走表を取得する", type="primary"):
                 points["2_honsen"],
                 points["2_ana"],
                 points["2_osae"],
+                odds_2_df,
             )
 
             h3, a3, o3 = generate_exact_bets(
@@ -974,6 +1039,7 @@ if st.button("出走表を取得する", type="primary"):
                 points["3_honsen"],
                 points["3_ana"],
                 points["3_osae"],
+                odds_3_df,
             )
 
             st.subheader("2連単予想")
@@ -1053,7 +1119,7 @@ if st.button("出走表を取得する", type="primary"):
             st.download_button(
                 "CSVダウンロード",
                 data=csv,
-                file_name="autorace_v3_0_exact_bets.csv",
+                file_name="autorace_v4_0_accuracy_special.csv",
                 mime="text/csv",
             )
 
