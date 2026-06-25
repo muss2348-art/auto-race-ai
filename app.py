@@ -5,10 +5,10 @@ import pandas as pd
 import streamlit as st
 from bs4 import BeautifulSoup
 
-st.set_page_config(page_title="オートレースAI Mobile v2.9", layout="wide")
+st.set_page_config(page_title="オートレースAI Mobile v2.9.1", layout="wide")
 
-st.title("🏍️ オートレースAI Mobile v2.9")
-st.caption("着順シミュレーションAI + AI指数 + ヒモ指数 + オッズ期待値 + 荒れ度AI")
+st.title("🏍️ オートレースAI Mobile v2.9.1")
+st.caption("指定点数ぴったり生成 + 着順シミュレーションAI")
 
 DEFAULT_URL = "https://www.winticket.jp/autorace/isesaki/racecard/2026062403/1/12"
 url = st.text_input("WINTICKET 出走表URL", DEFAULT_URL)
@@ -641,42 +641,84 @@ def unique_keep_order(items):
     return out
 
 
-def remove_used(items, used):
-    out = []
-    for x in items:
-        if x not in used:
-            out.append(x)
+def pick_exact(primary, fallback, n, used):
+    result = []
+
+    for x in primary:
+        if x not in used and x not in result:
+            result.append(x)
             used.add(x)
-    return out
+        if len(result) >= n:
+            return result
+
+    for x in fallback:
+        if x not in used and x not in result:
+            result.append(x)
+            used.add(x)
+        if len(result) >= n:
+            return result
+
+    return result
+
+
+def all_2rentan_bets(df):
+    cars = df["車番"].astype(int).tolist()
+    bets = []
+    for a in cars:
+        for b in cars:
+            if a != b:
+                bets.append(f"{a}-{b}")
+    return bets
+
+
+def all_3rentan_bets(df):
+    cars = df["車番"].astype(int).tolist()
+    bets = []
+    for a in cars:
+        for b in cars:
+            for c in cars:
+                if len({a, b, c}) == 3:
+                    bets.append(f"{a}-{b}-{c}")
+    return bets
 
 
 def make_2rentan_predictions(df, honsen_n, ana_n, osae_n):
     if df.empty or len(df) < 2:
         return [], [], []
 
-    cars = df.sort_values("1着率", ascending=False)["車番"].astype(int).tolist()
-    top = cars[0]
-    second = cars[1]
+    first_order = df.sort_values("1着率", ascending=False)["車番"].astype(int).tolist()
+    second_order = df.sort_values("2着率", ascending=False)["車番"].astype(int).tolist()
+    ai_order = df.sort_values("AI指数", ascending=False)["車番"].astype(int).tolist()
 
-    honsen_raw = [f"{top}-{c}" for c in cars[1:5]]
+    top = first_order[0]
 
-    ana_raw = [f"{second}-{top}"]
-    if len(cars) >= 3:
-        third = cars[2]
-        ana_raw += [f"{third}-{top}", f"{second}-{third}", f"{third}-{second}"]
-    if len(cars) >= 4:
-        fourth = cars[3]
-        ana_raw += [f"{fourth}-{top}", f"{second}-{fourth}"]
+    honsen_primary = []
+    for b in second_order:
+        if b != top:
+            honsen_primary.append(f"{top}-{b}")
 
-    osae_raw = [f"{top}-{c}" for c in cars[2:]]
-    if len(cars) >= 5:
-        osae_raw.append(f"{cars[4]}-{top}")
+    ana_primary = []
+    for a in first_order[1:5]:
+        for b in second_order[:5]:
+            if a != b:
+                ana_primary.append(f"{a}-{b}")
 
-    honsen = unique_keep_order(honsen_raw)[:honsen_n]
-    used = set(honsen)
-    ana = remove_used(unique_keep_order(ana_raw), used)[:ana_n]
-    used = set(honsen + ana)
-    osae = remove_used(unique_keep_order(osae_raw), used)[:osae_n]
+    osae_primary = []
+    for a in ai_order[:4]:
+        for b in ai_order:
+            if a != b:
+                osae_primary.append(f"{a}-{b}")
+
+    fallback = sorted(
+        all_2rentan_bets(df),
+        key=lambda x: score_bet(x, df),
+        reverse=True
+    )
+
+    used = set()
+    honsen = pick_exact(unique_keep_order(honsen_primary), fallback, honsen_n, used)
+    ana = pick_exact(unique_keep_order(ana_primary), fallback, ana_n, used)
+    osae = pick_exact(unique_keep_order(osae_primary), fallback, osae_n, used)
 
     return honsen, ana, osae
 
@@ -688,40 +730,41 @@ def make_3rentan_predictions(df, honsen_n, ana_n, osae_n):
     first_order = df.sort_values("1着率", ascending=False)["車番"].astype(int).tolist()
     second_order = df.sort_values("2着率", ascending=False)["車番"].astype(int).tolist()
     third_order = df.sort_values("3着率", ascending=False)["車番"].astype(int).tolist()
+    himo_order = df.sort_values("3着ヒモ指数", ascending=False)["車番"].astype(int).tolist()
 
     top = first_order[0]
-    second = second_order[0] if second_order[0] != top else second_order[1]
-    third = third_order[0] if third_order[0] not in [top, second] else third_order[1]
 
-    honsen_raw = []
-    ana_raw = []
-    osae_raw = []
-
-    for a in first_order[:3]:
+    honsen_primary = []
+    for a in first_order[:2]:
         for b in second_order[:4]:
             for c in third_order[:5]:
+                if a == top and len({a, b, c}) == 3:
+                    honsen_primary.append(f"{a}-{b}-{c}")
+
+    ana_primary = []
+    for a in first_order[1:4]:
+        for b in second_order[:5]:
+            for c in third_order[:6]:
                 if len({a, b, c}) == 3:
-                    if a == top:
-                        honsen_raw.append(f"{a}-{b}-{c}")
-                    elif a in first_order[1:3]:
-                        ana_raw.append(f"{a}-{b}-{c}")
+                    ana_primary.append(f"{a}-{b}-{c}")
 
-    main_pairs = []
-    for a in first_order[:3]:
-        for b in second_order[:4]:
-            if a != b:
-                main_pairs.append((a, b))
+    osae_primary = []
+    for a in first_order[:4]:
+        for b in second_order[:5]:
+            for c in unique_keep_order(himo_order[:8] + third_order[:8]):
+                if len({a, b, c}) == 3:
+                    osae_primary.append(f"{a}-{b}-{c}")
 
-    for a, b in unique_keep_order(main_pairs):
-        for c in third_order[:8]:
-            if c not in [a, b]:
-                osae_raw.append(f"{a}-{b}-{c}")
+    fallback = sorted(
+        all_3rentan_bets(df),
+        key=lambda x: score_bet(x, df),
+        reverse=True
+    )
 
-    honsen = unique_keep_order(honsen_raw)[:honsen_n]
-    used = set(honsen)
-    ana = remove_used(unique_keep_order(ana_raw), used)[:ana_n]
-    used = set(honsen + ana)
-    osae = remove_used(unique_keep_order(osae_raw), used)[:osae_n]
+    used = set()
+    honsen = pick_exact(unique_keep_order(honsen_primary), fallback, honsen_n, used)
+    ana = pick_exact(unique_keep_order(ana_primary), fallback, ana_n, used)
+    osae = pick_exact(unique_keep_order(osae_primary), fallback, osae_n, used)
 
     return honsen, ana, osae
 
@@ -942,26 +985,32 @@ if st.button("出走表を取得する", type="primary"):
 
             st.subheader("2連単予想")
             col1, col2, col3 = st.columns(3)
+
             with col1:
-                st.markdown("### 🔥 本線")
+                st.markdown(f"### 🔥 本線（{len(h2)}点）")
                 st.dataframe(add_odds_to_bets(h2, odds_2_df, df, "2連単"), use_container_width=True)
+
             with col2:
-                st.markdown("### 🎯 穴")
+                st.markdown(f"### 🎯 穴（{len(a2)}点）")
                 st.dataframe(add_odds_to_bets(a2, odds_2_df, df, "2連単"), use_container_width=True)
+
             with col3:
-                st.markdown("### 🛡️ 抑え")
+                st.markdown(f"### 🛡️ 抑え（{len(o2)}点）")
                 st.dataframe(add_odds_to_bets(o2, odds_2_df, df, "2連単"), use_container_width=True)
 
             st.subheader("3連単予想")
             col4, col5, col6 = st.columns(3)
+
             with col4:
-                st.markdown("### 🔥 本線")
+                st.markdown(f"### 🔥 本線（{len(h3)}点）")
                 st.dataframe(add_odds_to_bets(h3, odds_3_df, df, "3連単"), use_container_width=True)
+
             with col5:
-                st.markdown("### 🎯 穴")
+                st.markdown(f"### 🎯 穴（{len(a3)}点）")
                 st.dataframe(add_odds_to_bets(a3, odds_3_df, df, "3連単"), use_container_width=True)
+
             with col6:
-                st.markdown("### 🛡️ 抑え")
+                st.markdown(f"### 🛡️ 抑え（{len(o3)}点）")
                 st.dataframe(add_odds_to_bets(o3, odds_3_df, df, "3連単"), use_container_width=True)
 
             if use_odds:
@@ -1011,7 +1060,7 @@ if st.button("出走表を取得する", type="primary"):
             st.download_button(
                 "CSVダウンロード",
                 data=csv,
-                file_name="autorace_v2_9_simulation_ai.csv",
+                file_name="autorace_v2_9_1_exact_points.csv",
                 mime="text/csv",
             )
 
